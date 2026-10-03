@@ -13,6 +13,7 @@ const HEARTBEAT_MS = 2000;
 const STALE_MS = 7000;     // no word from a peer this long → show "signal lost"
 const DROP_MS = 25000;     // ...this long → drop the link and wait for a redial
 const RESCAN_MS = 12000;   // how often to look for officials we're not linked to
+const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 
 const state = {
   me: null,                // { name, role }
@@ -31,6 +32,11 @@ const state = {
   mode: localStorage.getItem('rc.mode') || 'open',  // 'open' | 'ptt'
   muted: false,
   pttDown: false,
+  burstUntil: 0,           // headset-triggered talk window (push-to-talk mode)
+  burstTick: null,
+  lastHeadset: 0,
+  headsetSeen: null,       // last headset action received, shown so officials can test their buttons
+  keepAlive: null,         // silent looping <audio> that keeps the page's media session active
   audioCtx: null,
   localAnalyser: null,
   wakeLock: null,
@@ -98,6 +104,7 @@ async function join() {
     // AudioContext must be created inside the tap on iOS.
     state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     state.audioCtx.resume();
+    startHeadsetSupport(); // also needs the tap, so it goes before any await
 
     const cfg = await fetch('/config.json').then(r => r.json()).catch(() => null);
     if (cfg?.hasTurn) state.iceServers = cfg.iceServers;
@@ -115,6 +122,7 @@ async function join() {
       state.outStream = state.localStream;
     }
   } catch (err) {
+    stopHeadsetSupport();
     btn.disabled = false; btn.textContent = 'Join match';
     const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
     showJoinError(denied
@@ -130,6 +138,7 @@ async function join() {
   $('#join').hidden = true;
   $('#live').hidden = false;
   $('#codeLabel').textContent = room;
+  if (window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: `Ref Comms · Match ${room}`, artist: `${name} · ${role}` });
   setupLiveControls();
   applyTransmit();
   requestWakeLock();
@@ -420,14 +429,16 @@ function level(a) {
 // ---------- mic control ----------
 function isTransmitting() {
   if (!state.localTrack) return false;
-  return state.mode === 'open' ? !state.muted : state.pttDown;
+  return state.mode === 'open' ? !state.muted : (state.pttDown || state.burstUntil > 0);
 }
 function applyTransmit() {
   const live = isTransmitting();
   if (state.localTrack) state.localTrack.enabled = live;
   broadcast({ t: 'state', live });
   renderRoster();
-
+  renderTalk();
+}
+function renderTalk() {
   const talk = $('#talk');
   talk.className = 'talk';
   if (!state.localTrack) {
@@ -435,19 +446,123 @@ function applyTransmit() {
     $('#talkLabel').textContent = 'LISTENING';
     $('#talkSub').textContent = 'Listen-only mode';
     $('.mode').hidden = true;
+    $('#hsStatus').hidden = true;
     return;
   }
+  $('#hsStatus').textContent = state.mode === 'ptt'
+    ? `Headset button: talk for ${HEADSET_TALK_MS / 1000}s · ${headsetNote()}`
+    : `Headset button: mute / unmute · ${headsetNote()}`;
   if (state.mode === 'open') {
     if (state.muted) talk.classList.add('muted');
     $('#talkLabel').textContent = state.muted ? 'MUTED' : 'LIVE';
     $('#talkSub').textContent = state.muted ? 'Tap to go live' : 'Tap to mute';
   } else {
     talk.classList.add('ptt');
-    if (state.pttDown) talk.classList.add('down');
-    $('#talkLabel').textContent = state.pttDown ? 'TALKING' : 'HOLD';
-    $('#talkSub').textContent = state.pttDown ? 'Release to stop' : 'Hold to talk';
+    const talking = state.pttDown || state.burstUntil > 0;
+    if (talking) talk.classList.add('down');
+    $('#talkLabel').textContent = talking ? 'TALKING' : 'HOLD';
+    $('#talkSub').textContent = state.pttDown ? 'Release to stop'
+      : state.burstUntil ? `Headset · ${Math.max(1, Math.ceil((state.burstUntil - Date.now()) / 1000))}s left`
+      : 'Hold to talk';
   }
   document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === state.mode));
+}
+
+// ---------- headset / AirPods button ----------
+// Headset buttons reach web pages only as media keys (play/pause etc.) via the Media Session API,
+// and only while the page is playing media — hence a silent looping track. A press is a single
+// event with no release, so push-to-talk mode opens the mic for a fixed window instead.
+const HEADSET_ACTIONS = ['play', 'pause', 'togglemicrophone', 'nexttrack', 'previoustrack', 'stop'];
+
+function silentWavUrl(seconds = 10, rate = 8000) {
+  const n = seconds * rate;
+  const v = new DataView(new ArrayBuffer(44 + n));
+  const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true); v.setUint16(34, 8, true);
+  str(36, 'data'); v.setUint32(40, n, true);
+  new Uint8Array(v.buffer, 44).fill(128); // 8-bit silence
+  return URL.createObjectURL(new Blob([v.buffer], { type: 'audio/wav' }));
+}
+
+function startHeadsetSupport() {
+  if (!('mediaSession' in navigator)) return;
+  const el = new Audio(silentWavUrl());
+  el.loop = true;
+  el.setAttribute('playsinline', '');
+  // If the OS pauses it (e.g. on a button press), keep it going so presses keep arriving.
+  el.addEventListener('pause', () => { if (!state.leaving && state.keepAlive === el) el.play().catch(() => {}); });
+  el.play().catch(() => {});
+  state.keepAlive = el;
+  for (const action of HEADSET_ACTIONS) {
+    try { navigator.mediaSession.setActionHandler(action, () => onHeadsetButton(action)); } catch { /* unsupported action */ }
+  }
+}
+function stopHeadsetSupport() {
+  const el = state.keepAlive;
+  state.keepAlive = null;
+  el?.pause();
+  for (const action of HEADSET_ACTIONS) { try { navigator.mediaSession.setActionHandler(action, null); } catch { /* unsupported */ } }
+}
+
+function onHeadsetButton(action) {
+  const now = Date.now();
+  if (now - state.lastHeadset < 400) return; // one press can fire more than one action
+  state.lastHeadset = now;
+  state.headsetSeen = action;
+  try { navigator.mediaSession.playbackState = 'playing'; } catch { /* older browsers */ }
+  if (!state.localTrack) return renderTalk();
+
+  if (state.mode === 'ptt') {
+    startBurst(); // pressing again mid-window restarts the 5 seconds
+  } else {
+    state.muted = !state.muted;
+    applyTransmit();
+    cue(state.muted ? 'off' : 'on');
+  }
+  navigator.vibrate?.(25);
+}
+
+function startBurst() {
+  const wasTalking = state.burstUntil > 0;
+  state.burstUntil = Date.now() + HEADSET_TALK_MS;
+  clearInterval(state.burstTick);
+  state.burstTick = setInterval(() => {
+    if (Date.now() >= state.burstUntil) endBurst(true);
+    else renderTalk();
+  }, 250);
+  if (!wasTalking) applyTransmit();
+  cue('on');
+}
+function endBurst(withCue) {
+  if (!state.burstUntil) return;
+  state.burstUntil = 0;
+  clearInterval(state.burstTick);
+  applyTransmit();
+  if (withCue) cue('off');
+}
+
+function headsetNote() {
+  if (!('mediaSession' in navigator)) return 'not supported in this browser';
+  return state.headsetSeen ? `working (${state.headsetSeen})` : 'press once to test';
+}
+
+// Short chirp in the official's own ear (not sent to others): rising = mic open, falling = muted.
+function cue(kind) {
+  const ctx = state.audioCtx;
+  if (!ctx) return;
+  const t = ctx.currentTime;
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.frequency.setValueAtTime(kind === 'on' ? 660 : 880, t);
+  o.frequency.linearRampToValueAtTime(kind === 'on' ? 990 : 440, t + 0.12);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
+  o.connect(g).connect(ctx.destination);
+  o.start(t);
+  o.stop(t + 0.16);
 }
 
 function setupLiveControls() {
@@ -456,6 +571,7 @@ function setupLiveControls() {
     if (state.mode !== 'ptt' || !state.localTrack) return;
     e.preventDefault();
     talk.setPointerCapture?.(e.pointerId);
+    endBurst(false); // a finger on the button takes over from a headset window
     state.pttDown = true; applyTransmit();
     navigator.vibrate?.(15);
   };
@@ -483,6 +599,7 @@ function setupLiveControls() {
   document.addEventListener('keyup', e => { if (e.code === 'Space' && state.mode === 'ptt') pttEnd(); });
 
   document.querySelectorAll('.mode button').forEach(b => b.addEventListener('click', () => {
+    endBurst(false);
     state.mode = b.dataset.mode; state.pttDown = false; state.muted = false;
     localStorage.setItem('rc.mode', state.mode);
     applyTransmit();
@@ -507,6 +624,7 @@ function setupLiveControls() {
 
 function leave() {
   state.leaving = true;
+  stopHeadsetSupport();
   broadcast({ t: 'bye' });
   state.timers.forEach(clearInterval);
   for (const id of [...state.peers.keys()]) removePeer(id);
