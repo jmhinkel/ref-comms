@@ -27,7 +27,7 @@ The site is fully static: HTML/CSS/JS in `public/`, plus one tiny Netlify functi
 1. Push this folder to a GitHub repo.
 2. In Netlify: **Add new site → Import an existing project → GitHub**, then pick the repo.
    The settings come from `netlify.toml`, so you don't need to change anything. Deploy.
-3. Open the `https://….netlify.app` URL on your phone. Every push to GitHub redeploys automatically.
+3. Open the `https://refcomms.netlify.app` URL on your phone. Every push to GitHub redeploys automatically.
 
 ## TURN relay (recommended before relying on it at a match)
 
