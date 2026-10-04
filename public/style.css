@@ -81,6 +81,7 @@ button { cursor: pointer; border: 0; border-radius: 12px; padding: 14px 18px; fo
 }
 .code-chip .label { color: var(--muted); font-size: .7rem; letter-spacing: .1em; }
 .net { margin-left: auto; font-size: .8rem; font-weight: 700; padding: 6px 10px; border-radius: 999px; }
+.tip { margin: 0 4px; padding: 12px 14px; border-radius: 12px; background: #0f2338; color: var(--blue); font-size: .9rem; line-height: 1.45; }
 .net.ok { color: var(--green); background: #10301f; }
 .net.warn { color: var(--amber); background: #3a2a08; }
 .net.bad { color: var(--red); background: #3a1010; }
@@ -161,4 +162,15 @@ dialog .row { margin: 12px 0 4px; }
 .qr { background: #fff; border-radius: 12px; padding: 12px; display: grid; place-items: center; }
 .qr svg { width: 100%; height: auto; max-width: 300px; }
 .big-code { text-align: center; font-size: 2rem; font-weight: 900; letter-spacing: .25em; margin: 12px 0 0; }
+.log-dlg { width: min(94vw, 560px); }
+.log-dlg h2 { text-align: left; }
+.log-dlg .row form { flex: 1; display: flex; }
+.log-summary, .log-lines {
+  margin: 0 0 12px; padding: 10px 12px; border-radius: 10px;
+  background: var(--bg); border: 1px solid var(--line);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  white-space: pre-wrap; word-break: break-word;
+}
+.log-lines { max-height: 32dvh; overflow-y: auto; color: var(--muted); margin-top: 12px; }
+.log-hint { color: var(--muted); font-size: .85rem; margin: 10px 2px 0; }
 .url { text-align: center; color: var(--muted); font-size: .85rem; word-break: break-all; margin: 4px 0 0; }

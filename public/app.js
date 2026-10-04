@@ -14,6 +14,12 @@ const STALE_MS = 7000;     // no word from a peer this long → show "signal los
 const DROP_MS = 25000;     // ...this long → drop the link and wait for a redial
 const RESCAN_MS = 12000;   // how often to look for officials we're not linked to
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
+const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
+const APP_VERSION = '2026-10-04';
+const MIC_CONSTRAINTS = {
+  audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
+  video: false,
+};
 
 const state = {
   me: null,                // { name, role }
@@ -23,7 +29,11 @@ const state = {
   pj: null,                // PeerJS Peer
   netRetry: 0,
   reconnectTimer: null,
+  claiming: false,
   timers: [],
+  watchdog: null,
+  micRecovering: false,
+  lastCtxState: 'running',
   leaving: false,
   iceServers: null,        // null → PeerJS defaults (Google STUN + PeerJS's free TURN)
   localStream: null,
@@ -58,6 +68,18 @@ function roleAbbrev(role) {
   return { 'Referee': 'REF', 'AR 1': 'AR1', 'AR 2': 'AR2', '4th Official': '4TH', 'Assessor': 'ASR' }[role] || role.slice(0, 3).toUpperCase();
 }
 function shareUrl() { return `${location.origin}/?m=${state.room}`; }
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const nameOf = p => p.info?.name || `seat ${p.id.split('-').pop()}`;
+const audioUp = p => p.call?.peerConnection?.connectionState === 'connected';
+
+// Rolling connection log, viewable/copyable from the status pill, so a dropout can be diagnosed afterwards.
+const logLines = [];
+function note(msg) {
+  logLines.push(`${new Date().toTimeString().slice(0, 8)}  ${msg}`);
+  if (logLines.length > 500) logLines.shift();
+  console.info('[ref-comms]', msg);
+  if ($('#logDlg')?.open) renderLog();
+}
 function myInfo() { return { ...state.me, listenOnly: !state.localTrack, live: isTransmitting() }; }
 
 // ---------- join screen ----------
@@ -81,6 +103,24 @@ function initJoin() {
   } else if (!window.Peer) {
     showJoinError('Couldn\'t load the connection library. Check your internet connection and reload.');
   }
+  showMicTip();
+}
+
+// Returning officials who keep getting the mic prompt: tell them how to make the browser remember it.
+async function showMicTip() {
+  if (!localStorage.getItem('rc.name') || !navigator.permissions?.query) return;
+  try {
+    const status = await navigator.permissions.query({ name: 'microphone' });
+    const update = () => {
+      const tip = $('#micTip');
+      tip.hidden = status.state === 'granted';
+      tip.textContent = status.state === 'denied'
+        ? `The microphone is blocked for this site. ${micSettingsHelp()}`
+        : `Tired of the microphone prompt every time? ${micSettingsHelp()}${isIOS ? '' : ' If Chrome asks, choose "Allow while visiting the site", not "Only this time".'}`;
+    };
+    update();
+    status.onchange = update;
+  } catch { /* Permissions API can't query the mic in this browser */ }
 }
 function syncListenOnly() {
   const opt = $('#role').selectedOptions[0];
@@ -112,24 +152,18 @@ async function join() {
     if (listenOnly) {
       state.outStream = state.audioCtx.createMediaStreamDestination().stream; // silence
     } else {
-      state.localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
-        video: false,
-      });
-      state.localTrack = state.localStream.getAudioTracks()[0];
-      state.localTrack.addEventListener('ended', () => showBanner('Microphone stopped — another app may have taken it. Tap to rejoin.', () => location.reload()));
-      state.localAnalyser = makeAnalyser(state.localStream);
-      state.outStream = state.localStream;
+      useMicStream(await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS));
     }
   } catch (err) {
     stopHeadsetSupport();
     btn.disabled = false; btn.textContent = 'Join match';
     const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
     showJoinError(denied
-      ? 'Microphone permission was blocked. Allow it in your browser settings, or tick "Listen only".'
+      ? `Microphone permission was blocked. ${micSettingsHelp()} Or tick "Listen only".`
       : `Couldn't start the microphone (${err.message || err.name}).`);
     return;
   }
+  note(`joined match ${room} as ${role} · app ${APP_VERSION} · ${state.iceServers ? 'own TURN' : 'PeerJS relays'} · ${navigator.userAgent}`);
 
   state.me = { name, role };
   state.room = room;
@@ -143,6 +177,90 @@ async function join() {
   applyTransmit();
   requestWakeLock();
   requestAnimationFrame(meterLoop);
+  state.watchdog = setInterval(watchdog, WATCHDOG_MS);
+  claimSeat();
+}
+
+// ---------- microphone ----------
+function useMicStream(stream) {
+  const track = stream.getAudioTracks()[0];
+  state.localStream = stream;
+  state.localTrack = track;
+  state.outStream = stream;
+  state.localAnalyser = makeAnalyser(stream);
+  track.addEventListener('ended', () => {
+    note('microphone stopped by the system');
+    if (!state.leaving) recoverMic();
+  });
+  track.addEventListener('mute', () => note('microphone paused by the system (call, Siri or another app?)'));
+  track.addEventListener('unmute', () => note('microphone resumed'));
+}
+
+// Restart the mic in place and swap it into every live call — no page reload, so no new permission prompt
+// on browsers that remember the grant for the session.
+async function recoverMic() {
+  if (state.micRecovering || state.leaving || !state.localTrack) return;
+  state.micRecovering = true;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia(MIC_CONSTRAINTS);
+    const old = state.localStream;
+    useMicStream(stream);
+    old?.getTracks().forEach(t => t.stop());
+    for (const p of state.peers.values()) {
+      for (const sender of p.call?.peerConnection?.getSenders() || []) {
+        if (!sender.track || sender.track.kind === 'audio') await sender.replaceTrack(state.localTrack).catch(() => {});
+      }
+    }
+    applyTransmit();
+    hideBanner();
+    note('microphone restarted');
+  } catch (err) {
+    note(`microphone restart failed: ${err.name}`);
+    showBanner('Your microphone stopped. Tap to turn it back on.', () => { hideBanner(); recoverMic(); });
+  } finally {
+    state.micRecovering = false;
+  }
+}
+
+function micSettingsHelp() {
+  return isIOS
+    ? 'On iPhone: Settings → Apps → Safari → Microphone → Allow (older iOS: Settings → Safari → Microphone).'
+    : 'In Chrome: tap the icon left of the web address → Permissions → Microphone → Allow.';
+}
+
+// ---------- self-repair ----------
+// Phones interrupt things quietly (calls, notifications, Bluetooth switching, network handovers).
+// Rather than waiting for someone to notice and reload, check everything every few seconds.
+function watchdog() {
+  if (state.leaving) return;
+  const pj = state.pj;
+  if (!state.claiming && (!pj || pj.destroyed)) { note('watchdog: lost our seat — rejoining'); claimSeat(); }
+  else if (pj?.disconnected) scheduleReconnect();
+
+  const ctx = state.audioCtx;
+  if (ctx && ctx.state !== state.lastCtxState) { note(`audio engine ${ctx.state}`); state.lastCtxState = ctx.state; }
+  if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+
+  for (const p of state.peers.values()) {
+    if (p.audio?.srcObject && p.audio.paused) {
+      note(`watchdog: ${nameOf(p)}'s audio was paused — restarting`);
+      p.audio.play().catch(() => showBanner('Tap to turn match audio back on', unlockAudio));
+    }
+  }
+  if (state.keepAlive?.paused) state.keepAlive.play().catch(() => {});
+  if (state.localTrack?.readyState === 'ended') recoverMic();
+  if (document.visibilityState === 'visible' && (!state.wakeLock || state.wakeLock.released)) requestWakeLock();
+}
+
+// Tear down every link and rejoin — keeps the mic, so it's a reset without a reload.
+function reconnectAll() {
+  note('manual reconnect');
+  state.timers.forEach(clearInterval);
+  state.timers = [];
+  for (const id of [...state.peers.keys()]) removePeer(id);
+  const pj = state.pj;
+  state.pj = null;
+  pj?.destroy();
   claimSeat();
 }
 
@@ -154,32 +272,48 @@ function peerOptions() {
 }
 
 async function claimSeat() {
-  setNet('warn', 'Connecting…');
+  if (state.claiming || state.leaving) return;
+  state.claiming = true;
+  try {
+    while (!state.leaving) {
+      setNet('warn', 'Connecting…');
+      const result = await tryAllSeats();
+      if (result === 'ok') return;
+      if (result === 'full') {
+        setNet('bad', 'Match full');
+        showBanner(`This match is full (${MAX_SLOTS} officials max).`);
+        return; // the watchdog tries again in case a seat frees up
+      }
+      note('connection service unreachable — retrying');
+      setNet('bad', 'Offline');
+      showBanner('Can\'t reach the connection service — retrying…');
+      await sleep(3000);
+    }
+  } finally {
+    state.claiming = false;
+  }
+}
+
+async function tryAllSeats() {
   const key = `rc.slot.${state.room}`;
-  const preferred = Number(sessionStorage.getItem(key)) || 0;
+  const preferred = state.slot || Number(sessionStorage.getItem(key)) || 0;
   // After a reload the server may hold our old seat for a moment — wait for it before taking another.
   const order = preferred ? [preferred, preferred, preferred] : [];
   for (let s = 1; s <= MAX_SLOTS; s++) if (s !== preferred) order.push(s);
 
   for (const slot of order) {
-    if (state.leaving) return;
+    if (state.leaving) return 'error';
     const result = await openSeat(slot);
     if (result === 'ok') {
       sessionStorage.setItem(key, String(slot));
       hideBanner();
       onSeated();
-      return;
+      return 'ok';
     }
-    if (result === 'error') {
-      setNet('bad', 'Offline');
-      showBanner('Can\'t reach the connection service — retrying…');
-      await sleep(3000);
-      return claimSeat();
-    }
+    if (result === 'error') return 'error';
     if (slot === preferred) await sleep(1500);
   }
-  setNet('bad', 'Match full');
-  showBanner(`This match is full (${MAX_SLOTS} officials max).`);
+  return 'full';
 }
 
 function openSeat(slot) {
@@ -198,25 +332,28 @@ function onSeated() {
   state.timers.forEach(clearInterval);
   state.netRetry = 0;
   setNet('ok', 'Connected');
+  note(`took seat ${state.slot}`);
   renderRoster();
 
   pj.on('connection', dc => setupLink(dc, false));
   pj.on('call', onIncomingCall);
-  pj.on('open', () => { state.netRetry = 0; setNet('ok', 'Connected'); renderRoster(); });
+  pj.on('open', () => { state.netRetry = 0; note('connection service back'); setNet('ok', 'Connected'); renderRoster(); });
   // Losing the PeerJS server doesn't cut existing audio — only new joins need it.
   pj.on('disconnected', () => {
-    if (state.leaving || pj.destroyed) return;
+    if (state.leaving || pj.destroyed || state.pj !== pj) return;
+    note('lost connection service (audio links unaffected)');
     setNet('warn', 'Reconnecting…');
     scheduleReconnect();
   });
   pj.on('error', err => {
-    if (err.type === 'peer-unavailable') return; // rang an empty seat — expected
+    if (err.type === 'peer-unavailable' || state.pj !== pj) return; // rang an empty seat — expected
+    note(`connection service error: ${err.type}`);
     if (err.type === 'unavailable-id') {         // seat was taken while we were offline
+      state.pj = null;
       pj.destroy();
       claimSeat();
       return;
     }
-    console.warn('peer error', err.type, err);
     if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type)) scheduleReconnect();
   });
 
@@ -225,11 +362,13 @@ function onSeated() {
 }
 
 function scheduleReconnect() {
-  clearTimeout(state.reconnectTimer);
+  if (state.reconnectTimer) return; // one attempt in flight at a time, so backoff can't be reset forever
   const delay = Math.min(1000 * 2 ** state.netRetry++, 8000);
   state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null;
     const pj = state.pj;
-    if (!state.leaving && pj && !pj.destroyed && pj.disconnected) pj.reconnect();
+    if (state.leaving || !pj || pj.destroyed || !pj.disconnected) return;
+    try { pj.reconnect(); } catch (err) { note(`reconnect failed: ${err.message}`); }
   }, delay);
 }
 
@@ -240,8 +379,8 @@ function scan(initial) {
     const rid = seatId(s);
     if (rid === state.myId || state.dialing.has(rid)) continue;
     const p = state.peers.get(rid);
-    if (p && !p.stale) continue;
-    if (initial || p?.stale || state.myId < rid) dial(rid);
+    if (p && p.dc?.open && !p.stale) continue;
+    if (initial || state.myId < rid || (p && (p.stale || !p.dc?.open))) dial(rid);
   }
 }
 
@@ -288,13 +427,23 @@ function setupLink(dc, outgoing) {
     const old = p.dc;
     p.dc = dc; p.lastSeen = Date.now(); p.stale = false;
     if (old && old !== dc) { closeCall(p); old.close(); }
+    note(`${nameOf(p)}: link open`);
     dc.send({ t: 'hello', info: myInfo() });
     renderRoster();
   });
   dc.on('data', msg => onData(dc, msg));
   dc.on('close', () => {
     const p = state.peers.get(dc.peer);
-    if (p && p.dc === dc) removePeer(p.id);
+    if (!p || p.dc !== dc) return;
+    if (audioUp(p)) {
+      // Presence channel hiccuped but audio is still flowing — keep talking and quietly redial it.
+      note(`${nameOf(p)}: data link closed, audio still up — redialling`);
+      p.dc = null;
+      renderRoster();
+      return;
+    }
+    note(`${nameOf(p)}: link closed`);
+    removePeer(p.id);
   });
   dc.on('error', () => {});
 }
@@ -315,6 +464,7 @@ function onData(dc, msg) {
       if (p.info) { p.info.live = !!msg.live; renderRoster(); }
       break;
     case 'bye':
+      note(`${nameOf(p)}: left`);
       removePeer(p.id);
       break;
   }
@@ -340,8 +490,11 @@ function attachCall(p, call) {
   if (old && old !== call) old.close();
   call.on('stream', stream => attachRemoteAudio(p, stream));
   call.on('close', () => {
+    clearTimeout(p.discTimer);
     if (p.call !== call) return;
     p.call = null;
+    p.route = null;
+    note(`${nameOf(p)}: audio closed`);
     renderRoster();
     // Audio dropped but the link is up — the caller rings again.
     if (state.peers.get(p.id) === p && p.dc?.open && p.dc._rcOutgoing) {
@@ -351,10 +504,38 @@ function attachCall(p, call) {
   call.on('error', () => {});
   call.peerConnection?.addEventListener('connectionstatechange', () => {
     if (p.call !== call) return;
-    if (call.peerConnection.connectionState === 'failed') call.close();
+    const s = call.peerConnection.connectionState;
+    note(`${nameOf(p)}: audio ${s}`);
+    clearTimeout(p.discTimer);
+    if (s === 'connected') describeRoute(p, call);
+    // "disconnected" often heals by itself; if it hasn't within 10 s, rebuild rather than sit in silence.
+    if (s === 'disconnected') {
+      p.discTimer = setTimeout(() => {
+        if (p.call !== call || call.peerConnection.connectionState === 'connected') return;
+        note(`${nameOf(p)}: audio stuck — rebuilding`);
+        call.close();
+      }, 10000);
+    }
+    if (s === 'failed') call.close();
     renderRoster();
   });
   renderRoster();
+}
+
+// Log whether audio is going direct or through a relay — the first thing to know when a link misbehaves.
+async function describeRoute(p, call) {
+  try {
+    const stats = await call.peerConnection.getStats();
+    let pair = null;
+    stats.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId); });
+    if (!pair) stats.forEach(s => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
+    if (!pair) return;
+    const local = stats.get(pair.localCandidateId);
+    const remote = stats.get(pair.remoteCandidateId);
+    p.route = local?.candidateType === 'relay' || remote?.candidateType === 'relay' ? 'relay' : 'direct';
+    note(`${nameOf(p)}: audio path ${p.route} (${local?.candidateType}→${remote?.candidateType}, ${local?.protocol}${local?.url ? ', ' + local.url : ''})`);
+    renderRoster();
+  } catch { /* stats are best-effort */ }
 }
 
 function closeCall(p) {
@@ -367,6 +548,7 @@ function removePeer(id) {
   const p = state.peers.get(id);
   if (!p) return;
   state.peers.delete(id);
+  clearTimeout(p.discTimer);
   closeCall(p);
   const dc = p.dc; p.dc = null; dc?.close();
   if (p.audio) { p.audio.srcObject = null; p.audio.remove(); }
@@ -378,8 +560,14 @@ function heartbeat() {
   for (const p of [...state.peers.values()]) {
     if (p.dc?.open) { try { p.dc.send({ t: 'ping' }); } catch { /* channel closing */ } }
     const quiet = now - p.lastSeen;
-    if (quiet > DROP_MS) { removePeer(p.id); continue; }
-    const stale = quiet > STALE_MS;
+    // Missed pings alone never cut audio that's still flowing — only a link that's dead on both counts.
+    const up = audioUp(p);
+    if (quiet > DROP_MS && !up) {
+      note(`${nameOf(p)}: no contact for ${Math.round(quiet / 1000)}s — dropping`);
+      removePeer(p.id);
+      continue;
+    }
+    const stale = quiet > STALE_MS && !up;
     if (stale !== p.stale) { p.stale = stale; renderRoster(); }
   }
 }
@@ -613,7 +801,16 @@ function setupLiveControls() {
   });
   $('#copyLink').addEventListener('click', copyLink);
 
+  $('#netStatus').addEventListener('click', () => { renderLog(); $('#logDlg').showModal(); });
+  $('#reconnectBtn').addEventListener('click', () => { $('#logDlg').close(); reconnectAll(); });
+  $('#copyLog').addEventListener('click', () => {
+    navigator.clipboard?.writeText(logText()).then(() => { $('#copyLog').textContent = 'Copied'; setTimeout(() => $('#copyLog').textContent = 'Copy log', 1500); });
+  });
+  window.addEventListener('online', () => note('phone network back online'));
+  window.addEventListener('offline', () => note('phone network offline'));
+
   document.addEventListener('visibilitychange', () => {
+    note(`app ${document.visibilityState === 'visible' ? 'back on screen' : 'hidden (screen off or switched app)'}`);
     if (document.visibilityState !== 'visible') return;
     requestWakeLock();
     state.audioCtx?.resume();
@@ -624,6 +821,7 @@ function setupLiveControls() {
 
 function leave() {
   state.leaving = true;
+  clearInterval(state.watchdog);
   stopHeadsetSupport();
   broadcast({ t: 'bye' });
   state.timers.forEach(clearInterval);
@@ -656,9 +854,36 @@ function copyLink() {
 async function requestWakeLock() {
   try {
     if ('wakeLock' in navigator && document.visibilityState === 'visible') {
-      state.wakeLock = await navigator.wakeLock.request('screen');
+      const lock = await navigator.wakeLock.request('screen');
+      state.wakeLock = lock;
+      state.wakeLockErr = null;
+      lock.addEventListener('release', () => note('screen keep-awake released'));
     }
-  } catch { /* not fatal */ }
+  } catch (err) {
+    // The watchdog retries every few seconds; only log when the reason changes.
+    if (state.wakeLockErr !== err.name) note(`screen keep-awake unavailable: ${err.name}`);
+    state.wakeLockErr = err.name;
+  }
+}
+
+// ---------- connection log ----------
+function logSummary() {
+  const pj = state.pj;
+  const lines = [
+    `Ref Comms ${APP_VERSION} · match ${state.room} · seat ${state.slot || '-'} · ${state.me?.role}`,
+    `Connection service: ${!pj ? 'none' : pj.destroyed ? 'destroyed' : pj.disconnected ? 'disconnected' : 'connected'} · relays: ${state.iceServers ? 'own TURN' : 'PeerJS free'}`,
+    `Mic: ${!state.localTrack ? 'listen only' : `${state.localTrack.readyState}${state.localTrack.muted ? ' (paused by system)' : ''}`} · audio engine: ${state.audioCtx?.state}`,
+  ];
+  for (const p of state.peers.values()) {
+    lines.push(`  ${nameOf(p)} (${p.info?.role || '?'}): audio ${p.call?.peerConnection?.connectionState || 'none'}${p.route ? ' / ' + p.route : ''}, data ${p.dc?.open ? 'open' : 'closed'}, last heard ${Math.round((Date.now() - p.lastSeen) / 1000)}s ago`);
+  }
+  return lines.join('\n');
+}
+function logText() { return `${logSummary()}\n\n${logLines.join('\n')}`; }
+function renderLog() {
+  $('#logSummary').textContent = logSummary();
+  const pre = $('#logLines');
+  pre.textContent = logLines.slice().reverse().join('\n') || 'Nothing logged yet.';
 }
 
 function setNet(kind, text) { const el = $('#netStatus'); el.className = `net ${kind}`; el.textContent = text; }
@@ -674,7 +899,7 @@ function hideBanner() { $('#banner').hidden = true; }
 function peerStatus(p) {
   if (p.stale) return ['bad', 'Signal lost — reconnecting'];
   const s = p.call?.peerConnection?.connectionState;
-  if (s === 'connected') return ['ok', 'Connected'];
+  if (s === 'connected') return ['ok', p.route === 'relay' ? 'Connected · relay' : 'Connected'];
   if (s === 'failed') return ['bad', 'Link failed — retrying'];
   if (s === 'disconnected') return ['warn', 'Weak link…'];
   return ['warn', 'Connecting audio…'];
