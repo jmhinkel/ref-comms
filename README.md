@@ -32,16 +32,30 @@ The site is fully static: HTML/CSS/JS in `public/`, plus one tiny Netlify functi
 ## TURN relay (recommended before relying on it at a match)
 
 Phones on 4G/5G are often behind carrier NAT, which blocks direct connections, and a TURN server relays the audio.
-PeerJS's free relays are a fallback with no guarantees. For match day, get your own credentials from
-metered.ca or Cloudflare Calls (both have free tiers). A full match for a 4-person crew uses only a few hundred MB.
+Without one, the app falls back to PeerJS's free shared relays, which come with no guarantees.
 
-In Netlify, go to **Site configuration → Environment variables** and add the following, then redeploy:
+**Cloudflare (recommended, free for about 1,000 GB a month):**
+
+1. In the Cloudflare dashboard, open **Realtime → TURN Server** and create a TURN key.
+2. Copy the **Turn Token ID** and **API Token** it shows you.
+3. In Netlify, go to **Site configuration → Environment variables**, add the following, then redeploy:
+
+```
+CF_TURN_KEY_ID=...
+CF_TURN_API_TOKEN=...
+```
+
+The Netlify function swaps these for short-lived relay credentials each time someone joins, so the key never reaches a phone.
+
+**Any other TURN server** (for example metered.ca) uses fixed credentials instead:
 
 ```
 TURN_URLS=turn:your.turn.host:3478,turns:your.turn.host:443
 TURN_USERNAME=...
 TURN_CREDENTIAL=...
 ```
+
+To check it's working, open the app, join, and tap the green **Connected** label. The summary should say `relays: Cloudflare`.
 
 ## Run locally
 
@@ -59,7 +73,12 @@ cloudflared tunnel --url http://localhost:3000
 ## Match-day tips
 
 - **Use earbuds or a Bluetooth earpiece.** If you use the phone speaker, the other officials will hear an echo.
+- **Turn Wi-Fi off during the match.** Clubhouse Wi-Fi drops out as you run to the far side of the pitch, and the switch
+  to mobile data breaks the call for a few seconds. With Wi-Fi off, phones stay on mobile data all match.
 - On iPhone, Safari stops the mic if the screen locks. The app keeps the screen on, but don't press the lock button.
-  Turn on Low Power Mode and lower the brightness to save battery.
+  **Don't use Low Power Mode**: it forces the screen to lock after 30 seconds. Lower the brightness to save battery instead.
+- On Android, set Chrome's battery use to **Unrestricted** (Settings → Apps → Chrome → Battery), so Android doesn't
+  throttle it mid-match.
+- If audio is choppy or drops, tap the status label → **Copy log**. It records signal quality every 30 seconds.
 - Pick an unusual match code (the **New match** button does this). Anyone who has the code can join.
 - Keyboard: on a laptop (for example in a TMO booth), Space is push-to-talk / mute.

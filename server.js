@@ -13,20 +13,15 @@ const MIME = {
   '.json': 'application/json', '.webmanifest': 'application/manifest+json',
 };
 
-function iceConfig() {
-  const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
-  const turn = process.env.TURN_URLS;
-  if (turn) {
-    iceServers.push({ urls: turn.split(',').map(s => s.trim()), username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
-  }
-  return { iceServers, hasTurn: !!turn };
-}
+// Run the real Netlify function so local testing exercises the same relay logic as production.
+const configFunction = import('./netlify/functions/config.mjs').then(m => m.default);
 
-http.createServer((req, res) => {
+http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/config.json') {
-    res.writeHead(200, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
-    return res.end(JSON.stringify(iceConfig()));
+    const response = await (await configFunction)();
+    res.writeHead(response.status, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
+    return res.end(await response.text());
   }
   const file = path.normalize(path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }

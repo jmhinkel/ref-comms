@@ -12,10 +12,13 @@ const SPEAKING_THRESHOLD = 0.035;
 const HEARTBEAT_MS = 2000;
 const STALE_MS = 7000;     // no word from a peer this long → show "signal lost"
 const DROP_MS = 25000;     // ...this long → drop the link and wait for a redial
-const RESCAN_MS = 12000;   // how often to look for officials we're not linked to
+const RESCAN_MS = 6000;    // how often to look for officials we're not linked to
+const STUCK_MS = 5000;     // audio "disconnected" this long → rebuild instead of waiting it out
+const QUALITY_MS = 10000;  // how often to sample packet loss / delay per official
+const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-10-04';
+const APP_VERSION = '2026-10-19';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -71,12 +74,15 @@ function shareUrl() { return `${location.origin}/?m=${state.room}`; }
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const nameOf = p => p.info?.name || `seat ${p.id.split('-').pop()}`;
 const audioUp = p => p.call?.peerConnection?.connectionState === 'connected';
+const relayLabel = () => ({ cloudflare: 'Cloudflare', static: 'own TURN' }[state.relayProvider] || 'PeerJS free');
+// Android Chrome reports wifi/cellular; iPhones don't expose it.
+const networkType = () => navigator.connection?.type || navigator.connection?.effectiveType || 'unknown';
 
 // Rolling connection log, viewable/copyable from the status pill, so a dropout can be diagnosed afterwards.
 const logLines = [];
 function note(msg) {
   logLines.push(`${new Date().toTimeString().slice(0, 8)}  ${msg}`);
-  if (logLines.length > 500) logLines.shift();
+  if (logLines.length > 2000) logLines.shift(); // a full match day with quality samples every 30 s
   console.info('[ref-comms]', msg);
   if ($('#logDlg')?.open) renderLog();
 }
@@ -148,6 +154,8 @@ async function join() {
 
     const cfg = await fetch('/config.json').then(r => r.json()).catch(() => null);
     if (cfg?.hasTurn) state.iceServers = cfg.iceServers;
+    state.relayProvider = cfg?.hasTurn ? cfg.provider : null;
+    state.relayError = cfg?.error || null;
 
     if (listenOnly) {
       state.outStream = state.audioCtx.createMediaStreamDestination().stream; // silence
@@ -163,7 +171,8 @@ async function join() {
       : `Couldn't start the microphone (${err.message || err.name}).`);
     return;
   }
-  note(`joined match ${room} as ${role} · app ${APP_VERSION} · ${state.iceServers ? 'own TURN' : 'PeerJS relays'} · ${navigator.userAgent}`);
+  note(`joined match ${room} as ${role} · app ${APP_VERSION} · relays: ${relayLabel()} · ${navigator.userAgent}`);
+  if (state.relayError) note(`own relay unavailable (${state.relayError}) — using fallback`);
 
   state.me = { name, role };
   state.room = room;
@@ -358,7 +367,11 @@ function onSeated() {
   });
 
   scan(true);
-  state.timers = [setInterval(heartbeat, HEARTBEAT_MS), setInterval(() => scan(false), RESCAN_MS)];
+  state.timers = [
+    setInterval(heartbeat, HEARTBEAT_MS),
+    setInterval(() => scan(false), RESCAN_MS),
+    setInterval(sampleQuality, QUALITY_MS),
+  ];
 }
 
 function scheduleReconnect() {
@@ -463,6 +476,14 @@ function onData(dc, msg) {
     case 'state':
       if (p.info) { p.info.live = !!msg.live; renderRoster(); }
       break;
+    case 'redial':
+      // The other phone lost our audio. If ours isn't healthy either, ring again now.
+      if (dc._rcOutgoing && !audioUp(p)) {
+        note(`${nameOf(p)}: asked to redial`);
+        if (p.call) closeCall(p);
+        placeCall(p);
+      }
+      break;
     case 'bye':
       note(`${nameOf(p)}: left`);
       removePeer(p.id);
@@ -472,7 +493,7 @@ function onData(dc, msg) {
 
 function placeCall(p) {
   if (!state.pj || !p.dc?.open) return;
-  const call = state.pj.call(p.id, state.outStream, { metadata: { link: p.dc.label } });
+  const call = state.pj.call(p.id, state.outStream, { metadata: { link: p.dc.label }, sdpTransform: tuneSdp });
   if (call) attachCall(p, call);
 }
 
@@ -480,8 +501,49 @@ function onIncomingCall(call) {
   const p = state.peers.get(call.peer);
   // Only accept calls tied to the link we kept; a call from a discarded link is stale.
   if (!p || !p.dc || call.metadata?.link !== p.dc.label) { call.close(); return; }
-  call.answer(state.outStream);
+  call.answer(state.outStream, { sdpTransform: tuneSdp });
   attachCall(p, call);
+}
+
+// Ask for voice-tuned Opus: in-band error correction (rebuilds lost packets from the next one),
+// DTX (near-zero data while someone is quiet or muted), mono, a modest bitrate, and 40 ms packets
+// (half the packet overhead). Both phones apply it, so each side asks the other for the same.
+function tuneSdp(sdp) {
+  const rtpmap = sdp.match(/a=rtpmap:(\d+) opus\/48000[^\r\n]*/i);
+  if (!rtpmap) return sdp;
+  const pt = rtpmap[1];
+  const want = { useinbandfec: '1', usedtx: '1', stereo: '0', 'sprop-stereo': '0', maxaveragebitrate: String(AUDIO_BITRATE) };
+  const fmtp = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+  const merge = existing => {
+    const params = Object.fromEntries(existing.split(';').map(s => s.trim()).filter(Boolean).map(s => {
+      const i = s.indexOf('=');
+      return [s.slice(0, i), s.slice(i + 1)];
+    }));
+    return Object.entries({ ...params, ...want }).map(([k, v]) => `${k}=${v}`).join(';');
+  };
+  let out = fmtp.test(sdp)
+    ? sdp.replace(fmtp, (_, existing) => `a=fmtp:${pt} ${merge(existing)}`)
+    : sdp.replace(rtpmap[0], `${rtpmap[0]}\r\na=fmtp:${pt} ${merge('')}`);
+  if (!/a=ptime:/.test(out)) out = out.replace(fmtp, line => `${line}\r\na=ptime:40`);
+  return out;
+}
+
+// Mark our outgoing audio as high priority (routers that honour it queue it ahead of other traffic)
+// and cap it at the voice bitrate.
+async function tuneSender(pc) {
+  for (const sender of pc.getSenders()) {
+    if (sender.track?.kind !== 'audio') continue;
+    try {
+      const params = sender.getParameters();
+      if (!params.encodings?.length) params.encodings = [{}];
+      for (const e of params.encodings) {
+        e.maxBitrate = AUDIO_BITRATE;
+        e.priority = 'high';
+        e.networkPriority = 'high';
+      }
+      await sender.setParameters(params);
+    } catch { /* not every browser lets us set these; the SDP tuning still applies */ }
+  }
 }
 
 function attachCall(p, call) {
@@ -494,12 +556,15 @@ function attachCall(p, call) {
     if (p.call !== call) return;
     p.call = null;
     p.route = null;
+    p.q = null;
+    p.qPrev = null;
     note(`${nameOf(p)}: audio closed`);
     renderRoster();
-    // Audio dropped but the link is up — the caller rings again.
-    if (state.peers.get(p.id) === p && p.dc?.open && p.dc._rcOutgoing) {
-      setTimeout(() => { if (state.peers.get(p.id) === p && !p.call) placeCall(p); }, 1000);
-    }
+    if (state.peers.get(p.id) !== p || !p.dc?.open) return;
+    // Audio dropped but the link is up: the caller rings again straight away. If we're the
+    // answering side, tell the caller — it may not have noticed yet.
+    if (p.dc._rcOutgoing) setTimeout(() => { if (state.peers.get(p.id) === p && !p.call) placeCall(p); }, 500);
+    else { try { p.dc.send({ t: 'redial' }); } catch { /* channel closing */ } }
   });
   call.on('error', () => {});
   call.peerConnection?.addEventListener('connectionstatechange', () => {
@@ -507,19 +572,83 @@ function attachCall(p, call) {
     const s = call.peerConnection.connectionState;
     note(`${nameOf(p)}: audio ${s}`);
     clearTimeout(p.discTimer);
-    if (s === 'connected') describeRoute(p, call);
-    // "disconnected" often heals by itself; if it hasn't within 10 s, rebuild rather than sit in silence.
+    if (s === 'connected') { describeRoute(p, call); tuneSender(call.peerConnection); }
+    // "disconnected" often heals by itself within a couple of seconds; if not, rebuild rather than sit in silence.
     if (s === 'disconnected') {
       p.discTimer = setTimeout(() => {
         if (p.call !== call || call.peerConnection.connectionState === 'connected') return;
         note(`${nameOf(p)}: audio stuck — rebuilding`);
         call.close();
-      }, 10000);
+      }, STUCK_MS);
     }
     if (s === 'failed') call.close();
     renderRoster();
   });
   renderRoster();
+}
+
+// Every 10 s, measure each incoming stream: packet loss, audible glitches (audio the phone had to
+// invent to cover gaps — DTX silence excluded), round-trip delay and jitter. Shown as a quality
+// hint in the roster and written to the log every 30 s, so a bad match can be diagnosed afterwards.
+let qualityRound = 0;
+async function sampleQuality() {
+  const parts = [];
+  for (const p of state.peers.values()) {
+    const pc = p.call?.peerConnection;
+    if (!pc || pc.connectionState !== 'connected') { p.q = null; continue; }
+    let inb = null, pair = null;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(s => {
+        if (s.type === 'inbound-rtp' && s.kind === 'audio') inb = s;
+        if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+      });
+    } catch { continue; }
+    if (!inb) continue;
+    const now = {
+      recv: inb.packetsReceived || 0, lost: Math.max(0, inb.packetsLost || 0),
+      samples: inb.totalSamplesReceived || 0,
+      glitch: (inb.concealedSamples || 0) - (inb.silentConcealedSamples || 0),
+    };
+    const prev = p.qPrev;
+    p.qPrev = now;
+    if (!prev) continue; // first sample is the baseline
+    const got = now.recv - prev.recv, lost = now.lost - prev.lost, samples = now.samples - prev.samples;
+    const q = {
+      loss: got + lost > 0 ? (100 * lost) / (got + lost) : 0,
+      glitch: samples > 0 ? (100 * Math.max(0, now.glitch - prev.glitch)) / samples : 0,
+      rtt: pair?.currentRoundTripTime != null ? Math.round(pair.currentRoundTripTime * 1000) : null,
+      jitter: inb.jitter != null ? Math.round(inb.jitter * 1000) : null,
+    };
+    q.level = q.loss > 10 || q.glitch > 10 ? 'poor' : q.loss > 3 || q.glitch > 3 || q.rtt > 500 ? 'fair' : 'good';
+    const changed = p.q?.level !== q.level;
+    p.q = q;
+    if (changed) { if (q.level !== 'good') note(`${nameOf(p)}: signal ${q.level}`); renderRoster(); }
+    parts.push(`${nameOf(p)} loss ${q.loss.toFixed(1)}% glitch ${q.glitch.toFixed(1)}%${q.rtt != null ? ` rtt ${q.rtt}ms` : ''}${q.jitter != null ? ` jitter ${q.jitter}ms` : ''}${p.route ? ' ' + p.route : ''}`);
+  }
+  if (++qualityRound % 3 === 0 && parts.length) note(`quality · ${parts.join(' | ')}`);
+}
+
+// Wi-Fi ↔ mobile data switch: the old network path is gone, so rebuild any audio that isn't
+// healthy right now instead of waiting for it to time out, and reconnect to matchmaking.
+function onNetworkChange(reason) {
+  note(`network changed (${reason}) → ${networkType()}`);
+  if (state.leaving || !state.pj) return;
+  if (state.pj.disconnected && !state.pj.destroyed) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    state.netRetry = 0;
+    scheduleReconnect();
+  }
+  setTimeout(() => {
+    for (const p of state.peers.values()) {
+      if (p.call && !audioUp(p)) {
+        note(`${nameOf(p)}: rebuilding audio after network change`);
+        p.call.close();
+      }
+    }
+    scan(false);
+  }, 2000); // give the new network a moment to come up
 }
 
 // Log whether audio is going direct or through a relay — the first thing to know when a link misbehaves.
@@ -806,7 +935,8 @@ function setupLiveControls() {
   $('#copyLog').addEventListener('click', () => {
     navigator.clipboard?.writeText(logText()).then(() => { $('#copyLog').textContent = 'Copied'; setTimeout(() => $('#copyLog').textContent = 'Copy log', 1500); });
   });
-  window.addEventListener('online', () => note('phone network back online'));
+  window.addEventListener('online', () => onNetworkChange('back online'));
+  navigator.connection?.addEventListener?.('change', () => onNetworkChange('connection type'));
   window.addEventListener('offline', () => note('phone network offline'));
 
   document.addEventListener('visibilitychange', () => {
@@ -871,11 +1001,11 @@ function logSummary() {
   const pj = state.pj;
   const lines = [
     `Ref Comms ${APP_VERSION} · match ${state.room} · seat ${state.slot || '-'} · ${state.me?.role}`,
-    `Connection service: ${!pj ? 'none' : pj.destroyed ? 'destroyed' : pj.disconnected ? 'disconnected' : 'connected'} · relays: ${state.iceServers ? 'own TURN' : 'PeerJS free'}`,
+    `Connection service: ${!pj ? 'none' : pj.destroyed ? 'destroyed' : pj.disconnected ? 'disconnected' : 'connected'} · relays: ${relayLabel()} · network: ${networkType()}`,
     `Mic: ${!state.localTrack ? 'listen only' : `${state.localTrack.readyState}${state.localTrack.muted ? ' (paused by system)' : ''}`} · audio engine: ${state.audioCtx?.state}`,
   ];
   for (const p of state.peers.values()) {
-    lines.push(`  ${nameOf(p)} (${p.info?.role || '?'}): audio ${p.call?.peerConnection?.connectionState || 'none'}${p.route ? ' / ' + p.route : ''}, data ${p.dc?.open ? 'open' : 'closed'}, last heard ${Math.round((Date.now() - p.lastSeen) / 1000)}s ago`);
+    lines.push(`  ${nameOf(p)} (${p.info?.role || '?'}): audio ${p.call?.peerConnection?.connectionState || 'none'}${p.route ? ' / ' + p.route : ''}${p.q ? `, ${p.q.level} (loss ${p.q.loss.toFixed(1)}%, glitch ${p.q.glitch.toFixed(1)}%${p.q.rtt != null ? `, rtt ${p.q.rtt}ms` : ""})` : ""}, data ${p.dc?.open ? 'open' : 'closed'}, last heard ${Math.round((Date.now() - p.lastSeen) / 1000)}s ago`);
   }
   return lines.join('\n');
 }
@@ -899,7 +1029,12 @@ function hideBanner() { $('#banner').hidden = true; }
 function peerStatus(p) {
   if (p.stale) return ['bad', 'Signal lost — reconnecting'];
   const s = p.call?.peerConnection?.connectionState;
-  if (s === 'connected') return ['ok', p.route === 'relay' ? 'Connected · relay' : 'Connected'];
+  if (s === 'connected') {
+    const via = p.route === 'relay' ? ' · relay' : '';
+    if (p.q?.level === 'poor') return ['bad', `Weak signal — choppy${via}`];
+    if (p.q?.level === 'fair') return ['warn', `Connected · patchy${via}`];
+    return ['ok', `Connected${via}`];
+  }
   if (s === 'failed') return ['bad', 'Link failed — retrying'];
   if (s === 'disconnected') return ['warn', 'Weak link…'];
   return ['warn', 'Connecting audio…'];
