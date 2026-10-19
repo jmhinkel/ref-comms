@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-10-19';
+const APP_VERSION = '2026-10-19.2';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -84,8 +84,80 @@ function note(msg) {
   logLines.push(`${new Date().toTimeString().slice(0, 8)}  ${msg}`);
   if (logLines.length > 2000) logLines.shift(); // a full match day with quality samples every 30 s
   console.info('[ref-comms]', msg);
+  saveLogSoon();
   if ($('#logDlg')?.open) renderLog();
 }
+
+// The log is also saved on the phone as the match goes, so it survives closing the tab, a reload or
+// a restart, and can be copied from the join screen afterwards. The last few matches are kept.
+const LOG_STORE = 'rc.logs';
+const LOG_MATCHES_KEPT = 3;
+let logSession = null;
+let logSaveTimer = null;
+
+function loadLogSessions() {
+  try { return JSON.parse(localStorage.getItem(LOG_STORE)) || []; } catch { return []; }
+}
+function startLogSession(room, role, name) {
+  logSession = { id: Date.now(), room, role, name, started: new Date().toISOString(), updated: null, summary: '', lines: logLines };
+}
+function saveLogSoon() {
+  if (logSession && !logSaveTimer) logSaveTimer = setTimeout(saveLog, 2000);
+}
+function saveLog() {
+  clearTimeout(logSaveTimer);
+  logSaveTimer = null;
+  if (!logSession) return;
+  logSession.updated = new Date().toISOString();
+  try { logSession.summary = logSummary(); } catch { /* keep the last summary */ }
+  let sessions = [...loadLogSessions().filter(s => s.id !== logSession.id), logSession].slice(-LOG_MATCHES_KEPT);
+  // If the phone's storage is tight, drop older matches first, then trim this one.
+  for (;;) {
+    try { localStorage.setItem(LOG_STORE, JSON.stringify(sessions)); return; } catch { /* quota or private mode */ }
+    if (sessions.length > 1) { sessions = sessions.slice(1); continue; }
+    try { localStorage.setItem(LOG_STORE, JSON.stringify([{ ...logSession, lines: logSession.lines.slice(-500) }])); } catch { /* storage unavailable */ }
+    return;
+  }
+}
+function sessionText(s) {
+  return `Ref Comms log · ${s.name} · ${s.role} · match ${s.room} · started ${new Date(s.started).toString()}\n\n${s.summary}\n\n${s.lines.join('\n')}`;
+}
+
+function copyText(text, btn, label) {
+  const done = msg => { btn.textContent = msg; setTimeout(() => { btn.textContent = label; }, 1800); };
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(() => done('Copied'), () => done('Copy failed'));
+  else done('Copy failed');
+}
+
+function renderPastLogs() {
+  const sessions = loadLogSessions().reverse();
+  $('#pastLogs').hidden = !sessions.length;
+  const list = $('#pastLogList');
+  list.innerHTML = '';
+  const time = d => d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
+  for (const s of sessions) {
+    const start = new Date(s.started), end = new Date(s.updated || s.started);
+    const row = document.createElement('div');
+    row.className = 'past-log';
+    row.innerHTML = '<div class="past-log-label"><b></b><span></span></div><div class="past-log-actions"></div>';
+    row.querySelector('b').textContent = `Match ${s.room} · ${s.role}`;
+    row.querySelector('span').textContent =
+      `${start.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' })} · ${time(start)}–${time(end)} · ${s.lines.length} entries`;
+    const actions = row.querySelector('.past-log-actions');
+    const copy = document.createElement('button');
+    copy.type = 'button'; copy.className = 'secondary'; copy.textContent = 'Copy';
+    copy.onclick = () => copyText(sessionText(s), copy, 'Copy');
+    actions.append(copy);
+    if (navigator.share) {
+      const share = document.createElement('button');
+      share.type = 'button'; share.className = 'secondary'; share.textContent = 'Share';
+      share.onclick = () => navigator.share({ title: `Ref Comms log · match ${s.room}`, text: sessionText(s) }).catch(() => {});
+      actions.append(share);
+    }
+    list.append(row);
+  }
+}
+
 function myInfo() { return { ...state.me, listenOnly: !state.localTrack, live: isTransmitting() }; }
 
 // ---------- join screen ----------
@@ -110,6 +182,12 @@ function initJoin() {
     showJoinError('Couldn\'t load the connection library. Check your internet connection and reload.');
   }
   showMicTip();
+  renderPastLogs();
+  $('#clearLogs').addEventListener('click', () => {
+    if (!confirm('Delete the saved match logs on this phone?')) return;
+    try { localStorage.removeItem(LOG_STORE); } catch { /* storage unavailable */ }
+    renderPastLogs();
+  });
 }
 
 // Returning officials who keep getting the mic prompt: tell them how to make the browser remember it.
@@ -171,6 +249,7 @@ async function join() {
       : `Couldn't start the microphone (${err.message || err.name}).`);
     return;
   }
+  startLogSession(room, role, name);
   note(`joined match ${room} as ${role} · app ${APP_VERSION} · relays: ${relayLabel()} · ${navigator.userAgent}`);
   if (state.relayError) note(`own relay unavailable (${state.relayError}) — using fallback`);
 
@@ -932,24 +1011,24 @@ function setupLiveControls() {
 
   $('#netStatus').addEventListener('click', () => { renderLog(); $('#logDlg').showModal(); });
   $('#reconnectBtn').addEventListener('click', () => { $('#logDlg').close(); reconnectAll(); });
-  $('#copyLog').addEventListener('click', () => {
-    navigator.clipboard?.writeText(logText()).then(() => { $('#copyLog').textContent = 'Copied'; setTimeout(() => $('#copyLog').textContent = 'Copy log', 1500); });
-  });
+  $('#copyLog').addEventListener('click', () => copyText(logText(), $('#copyLog'), 'Copy log'));
   window.addEventListener('online', () => onNetworkChange('back online'));
   navigator.connection?.addEventListener?.('change', () => onNetworkChange('connection type'));
   window.addEventListener('offline', () => note('phone network offline'));
 
   document.addEventListener('visibilitychange', () => {
     note(`app ${document.visibilityState === 'visible' ? 'back on screen' : 'hidden (screen off or switched app)'}`);
-    if (document.visibilityState !== 'visible') return;
+    if (document.visibilityState !== 'visible') { saveLog(); return; } // the tab may never come back
     requestWakeLock();
     state.audioCtx?.resume();
     if (state.pj && !state.pj.destroyed && state.pj.disconnected) { state.netRetry = 0; scheduleReconnect(); }
   });
-  window.addEventListener('pagehide', () => broadcast({ t: 'bye' }));
+  window.addEventListener('pagehide', () => { broadcast({ t: 'bye' }); note('page closed'); saveLog(); });
 }
 
 function leave() {
+  note('left the match');
+  saveLog();
   state.leaving = true;
   clearInterval(state.watchdog);
   stopHeadsetSupport();
