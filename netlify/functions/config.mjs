@@ -21,9 +21,15 @@ async function cloudflareIce(keyId, token) {
     .filter(s => s.urls.length);
 }
 
+// Netlify's own accessor first (recommended for functions), then process.env (local dev).
+// Trimmed, because a stray space pasted along with a value would break the request.
+const envVar = name => (globalThis.Netlify?.env?.get(name) ?? process.env[name] ?? '').trim();
+
 export default async () => {
-  const env = process.env;
+  const env = Object.fromEntries(['CF_TURN_KEY_ID', 'CF_TURN_API_TOKEN', 'TURN_URLS', 'TURN_USERNAME', 'TURN_CREDENTIAL'].map(k => [k, envVar(k)]));
   let iceServers = null, provider = null, error = null;
+  // Which settings this deploy can see — names only, never values — for troubleshooting setup.
+  const configured = { CF_TURN_KEY_ID: !!env.CF_TURN_KEY_ID, CF_TURN_API_TOKEN: !!env.CF_TURN_API_TOKEN, TURN_URLS: !!env.TURN_URLS };
 
   if (env.CF_TURN_KEY_ID && env.CF_TURN_API_TOKEN) {
     try {
@@ -43,7 +49,7 @@ export default async () => {
   }
 
   return Response.json(
-    { iceServers: iceServers || [GOOGLE_STUN], hasTurn: !!iceServers, provider, error },
+    { iceServers: iceServers || [GOOGLE_STUN], hasTurn: !!iceServers, provider, error, configured },
     { headers: { 'Cache-Control': 'no-store' } },
   );
 };
