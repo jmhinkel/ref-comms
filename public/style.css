@@ -81,6 +81,31 @@ button { cursor: pointer; border: 0; border-radius: 12px; padding: 14px 18px; fo
 }
 .code-chip .label { color: var(--muted); font-size: .7rem; letter-spacing: .1em; }
 .net { margin-left: auto; font-size: .8rem; font-weight: 700; padding: 6px 10px; border-radius: 999px; }
+.rejoin { border-color: var(--green-dim); gap: 10px; }
+.rejoin-text { display: flex; flex-direction: column; gap: 4px; }
+.rejoin-text b { font-size: 1.15rem; }
+.rejoin-text span { color: var(--muted); font-size: .9rem; }
+
+.pocket-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px; white-space: nowrap; }
+.pocket-btn span { color: var(--muted); font-weight: 500; }
+
+/* Pure black: OLED screens draw almost no power for black pixels. Text is dim for the same reason. */
+.pocket {
+  position: fixed; inset: 0; z-index: 1000;
+  background: #000; color: #fff;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+  touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+}
+.pocket-status { display: flex; align-items: center; gap: 10px; font-weight: 700; opacity: .4; }
+.pocket-status .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--green); }
+.pocket-status .dot.warn { background: var(--amber); }
+.pocket-status .dot.bad { background: var(--red); }
+.pocket-hint { font-size: .9rem; opacity: .25; }
+.pocket-progress { width: 50%; height: 4px; border-radius: 2px; background: #ffffff1a; overflow: hidden; opacity: 0; }
+.pocket.holding .pocket-progress { opacity: 1; }
+#pocketFill { display: block; height: 100%; width: 0; background: #ffffff99; }
+#pocketUnlock { min-width: 200px; padding: 18px; font-size: 1.1rem; }
+
 .past-logs { gap: 10px; }
 .past-logs h2 { margin: 0; font-size: 1.05rem; }
 .past-logs-hint { margin: 0; color: var(--muted); font-size: .85rem; }

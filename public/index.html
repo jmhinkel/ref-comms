@@ -23,6 +23,15 @@
       </div>
     </header>
 
+    <section id="rejoin" class="card rejoin" hidden>
+      <div class="rejoin-text">
+        <b id="rejoinTitle"></b>
+        <span id="rejoinSub"></span>
+      </div>
+      <button type="button" id="rejoinBtn" class="primary big">Rejoin match</button>
+      <button type="button" id="rejoinDismiss" class="ghost">Not now</button>
+    </section>
+
     <form id="joinForm" class="card" autocomplete="off">
       <label>Your name
         <input id="name" required maxlength="30" placeholder="e.g. Jay">
@@ -80,6 +89,10 @@
     <section id="roster" class="roster" aria-live="polite"></section>
 
     <section id="controls" class="controls">
+      <button id="pocketBtn" class="secondary pocket-btn">
+        <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 2a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8a2 2 0 0 0-2-2h-1V7a5 5 0 0 0-5-5zm-3 8V7a3 3 0 1 1 6 0v3H9z"/></svg>
+        Pocket mode <span>· mic stays on</span>
+      </button>
       <div class="mode" role="radiogroup" aria-label="Mic mode">
         <button data-mode="open" class="on" role="radio">Open mic</button>
         <button data-mode="ptt" role="radio">Push to talk</button>
@@ -118,6 +131,14 @@
       <form method="dialog"><button class="ghost wide">Close</button></form>
     </div>
   </dialog>
+
+  <!-- Pocket mode: black, touch-locked screen that keeps the call running -->
+  <div id="pocket" class="pocket" hidden>
+    <div class="pocket-status"><span id="pocketDot" class="dot ok"></span><span id="pocketText"></span></div>
+    <div class="pocket-hint">Press and hold to unlock</div>
+    <div class="pocket-progress"><span id="pocketFill"></span></div>
+    <button id="pocketUnlock" class="secondary" hidden>Tap to unlock</button>
+  </div>
 
   <div id="audioSink" hidden></div>
 

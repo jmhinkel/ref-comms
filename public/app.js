@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-10-19.2';
+const APP_VERSION = '2026-10-29';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -182,6 +182,7 @@ function initJoin() {
     showJoinError('Couldn\'t load the connection library. Check your internet connection and reload.');
   }
   showMicTip();
+  showRejoin();
   renderPastLogs();
   $('#clearLogs').addEventListener('click', () => {
     if (!confirm('Delete the saved match logs on this phone?')) return;
@@ -206,6 +207,51 @@ async function showMicTip() {
     status.onchange = update;
   } catch { /* Permissions API can't query the mic in this browser */ }
 }
+// ---------- one-tap rejoin ----------
+// Whatever match this phone was last in (and didn't Leave) is remembered, so if the tab is closed,
+// reloaded or crashes, the join screen offers a single button to get straight back into the same seat.
+const LAST_MATCH = 'rc.lastMatch';
+const REJOIN_WINDOW_MS = 3 * 60 * 60 * 1000; // long enough for a match plus a delayed restart
+
+function loadLastMatch() {
+  try {
+    const m = JSON.parse(localStorage.getItem(LAST_MATCH));
+    return m && Date.now() - m.at < REJOIN_WINDOW_MS ? m : null;
+  } catch { return null; }
+}
+function saveLastMatch() {
+  if (!state.me || state.leaving) return;
+  state.lastMatchSaved = Date.now();
+  try {
+    localStorage.setItem(LAST_MATCH, JSON.stringify({
+      room: state.room, name: state.me.name, role: state.me.role,
+      listenOnly: !state.localTrack, slot: state.slot || 0, at: Date.now(),
+    }));
+  } catch { /* storage unavailable */ }
+}
+function clearLastMatch() {
+  try { localStorage.removeItem(LAST_MATCH); } catch { /* storage unavailable */ }
+}
+
+function showRejoin() {
+  const m = loadLastMatch();
+  if (!m) return;
+  const mins = Math.round((Date.now() - m.at) / 60000);
+  $('#rejoinTitle').textContent = `Rejoin match ${m.room}`;
+  $('#rejoinSub').textContent = `As ${m.name} · ${m.role}${m.listenOnly ? ' (listen only)' : ''} · ${mins < 1 ? 'just now' : `${mins} min ago`}`;
+  $('#rejoin').hidden = false;
+  $('#rejoinBtn').onclick = () => {
+    $('#name').value = m.name;
+    $('#role').value = m.role;
+    $('#code').value = m.room;
+    $('#listenOnly').checked = !!m.listenOnly;
+    state.rejoinSlot = m.slot;
+    $('#rejoin').hidden = true;
+    join(); // still inside the tap, which iOS needs for audio
+  };
+  $('#rejoinDismiss').onclick = () => { clearLastMatch(); $('#rejoin').hidden = true; };
+}
+
 function syncListenOnly() {
   const opt = $('#role').selectedOptions[0];
   if (opt.hasAttribute('data-listen')) $('#listenOnly').checked = true;
@@ -242,6 +288,7 @@ async function join() {
     }
   } catch (err) {
     stopHeadsetSupport();
+    showRejoin();
     btn.disabled = false; btn.textContent = 'Join match';
     const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
     showJoinError(denied
@@ -255,6 +302,7 @@ async function join() {
 
   state.me = { name, role };
   state.room = room;
+  saveLastMatch();
   history.replaceState(null, '', `/?m=${room}`);
 
   $('#join').hidden = true;
@@ -338,6 +386,107 @@ function watchdog() {
   if (state.keepAlive?.paused) state.keepAlive.play().catch(() => {});
   if (state.localTrack?.readyState === 'ended') recoverMic();
   if (document.visibilityState === 'visible' && (!state.wakeLock || state.wakeLock.released)) requestWakeLock();
+  if (Date.now() - (state.lastMatchSaved || 0) > 60000) saveLastMatch(); // keep "rejoin" fresh
+}
+
+// The screen was off (or another app was in front). Don't wait for the next watchdog pass:
+// repair everything now, so the official is back on air within a second or two.
+function onBackOnScreen(hiddenFor) {
+  requestWakeLock();
+  state.audioCtx?.resume().catch(() => {});
+  if (state.pj && !state.pj.destroyed && state.pj.disconnected) {
+    clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = null;
+    state.netRetry = 0;
+    scheduleReconnect();
+  }
+  watchdog();
+  for (const p of state.peers.values()) {
+    if (p.call && !audioUp(p)) { note(`${nameOf(p)}: rebuilding audio after screen-off`); p.call.close(); }
+  }
+  scan(false);
+  // iPhones pause the mic while the screen is off; if it hasn't come back by itself, restart it.
+  setTimeout(() => {
+    if (state.leaving || !state.localTrack) return;
+    if (state.localTrack.muted || state.localTrack.readyState === 'ended') {
+      note('microphone still paused after screen-off — restarting it');
+      recoverMic();
+    }
+  }, 1500);
+  if (hiddenFor > 2000 && state.localTrack && !state.pocketTipShown) {
+    state.pocketTipShown = true;
+    showBanner(isIOS
+      ? 'Locking an iPhone cuts your mic. Use Pocket mode instead: the screen goes black and the mic stays on.'
+      : 'Tip: Pocket mode blacks out the screen and ignores pocket taps without dropping the call.',
+    () => { hideBanner(); enterPocket(); }, 'Use Pocket mode');
+  }
+}
+
+// ---------- pocket mode ----------
+// A black, touch-locked screen. The page stays "on screen" as far as the phone is concerned, so the
+// mic, audio and keep-awake all keep running, and pocket taps can't mute anyone or press Leave.
+// Unlocking takes a deliberate press-and-hold followed by a tap, which fabric won't do by accident.
+const POCKET_HOLD_MS = 1500;
+
+function enterPocket() {
+  if (state.pocket) return;
+  state.pocket = true;
+  $('#pocket').hidden = false;
+  $('#pocketUnlock').hidden = true;
+  updatePocket();
+  requestWakeLock();
+  note('pocket mode on');
+  document.documentElement.requestFullscreen?.({ navigationUI: 'hide' }).catch(() => {}); // Android: hides the bars
+}
+function exitPocket() {
+  if (!state.pocket) return;
+  state.pocket = false;
+  $('#pocket').hidden = true;
+  note('pocket mode off');
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+function updatePocket() {
+  if (!state.pocket) return;
+  const peers = [...state.peers.values()].filter(p => p.info);
+  const up = peers.filter(audioUp).length;
+  const mic = !state.localTrack ? 'Listening' : isTransmitting() ? 'LIVE' : state.mode === 'ptt' ? 'Push to talk' : 'Muted';
+  $('#pocketText').textContent = `${mic} · ${peers.length ? `${up} of ${peers.length} connected` : 'waiting for crew'}`;
+  $('#pocketDot').className = `dot ${!peers.length || up === peers.length ? 'ok' : up ? 'warn' : 'bad'}`;
+}
+
+function setupPocket() {
+  const el = $('#pocket');
+  let timer = null, raf = null, started = 0, hideUnlock = null;
+  const cancel = () => {
+    clearTimeout(timer); timer = null;
+    cancelAnimationFrame(raf);
+    $('#pocketFill').style.width = '0%';
+    el.classList.remove('holding');
+  };
+  el.addEventListener('pointerdown', e => {
+    if (e.target.closest('#pocketUnlock')) return;
+    e.preventDefault();
+    cancel();
+    started = performance.now();
+    el.classList.add('holding');
+    const tick = () => {
+      const p = Math.min(1, (performance.now() - started) / POCKET_HOLD_MS);
+      $('#pocketFill').style.width = `${p * 100}%`;
+      if (p < 1) raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    timer = setTimeout(() => {
+      cancel();
+      navigator.vibrate?.(30);
+      $('#pocketUnlock').hidden = false; // now lift your finger and tap it
+      clearTimeout(hideUnlock);
+      hideUnlock = setTimeout(() => { $('#pocketUnlock').hidden = true; }, 4000);
+    }, POCKET_HOLD_MS);
+  });
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => el.addEventListener(ev, cancel));
+  el.addEventListener('contextmenu', e => e.preventDefault());
+  $('#pocketUnlock').addEventListener('click', () => { clearTimeout(hideUnlock); exitPocket(); });
+  $('#pocketBtn').addEventListener('click', enterPocket);
 }
 
 // Tear down every link and rejoin — keeps the mic, so it's a reset without a reload.
@@ -384,7 +533,7 @@ async function claimSeat() {
 
 async function tryAllSeats() {
   const key = `rc.slot.${state.room}`;
-  const preferred = state.slot || Number(sessionStorage.getItem(key)) || 0;
+  const preferred = state.slot || Number(sessionStorage.getItem(key)) || state.rejoinSlot || 0;
   // After a reload the server may hold our old seat for a moment — wait for it before taking another.
   const order = preferred ? [preferred, preferred, preferred] : [];
   for (let s = 1; s <= MAX_SLOTS; s++) if (s !== preferred) order.push(s);
@@ -396,6 +545,7 @@ async function tryAllSeats() {
       sessionStorage.setItem(key, String(slot));
       hideBanner();
       onSeated();
+      saveLastMatch(); // now with the seat number, so a rejoin reclaims the same seat
       return 'ok';
     }
     if (result === 'error') return 'error';
@@ -1001,7 +1151,16 @@ function setupLiveControls() {
     applyTransmit();
   }));
 
-  $('#leaveBtn').addEventListener('click', leave);
+  $('#leaveBtn').addEventListener('click', () => {
+    if (confirm('Leave the match? The rest of the crew will lose you until you rejoin.')) leave();
+  });
+  // Closing the tab, swiping back or refreshing mid-match asks first (where the browser allows it).
+  window.addEventListener('beforeunload', e => {
+    if (state.leaving || !state.me) return;
+    e.preventDefault();
+    e.returnValue = '';
+  });
+  setupPocket();
   $('#shareBtn').addEventListener('click', openShare);
   $('#nativeShare').addEventListener('click', () => {
     if (navigator.share) navigator.share({ title: 'Ref Comms', text: `Join match ${state.room}`, url: shareUrl() }).catch(() => {});
@@ -1017,18 +1176,24 @@ function setupLiveControls() {
   window.addEventListener('offline', () => note('phone network offline'));
 
   document.addEventListener('visibilitychange', () => {
-    note(`app ${document.visibilityState === 'visible' ? 'back on screen' : 'hidden (screen off or switched app)'}`);
-    if (document.visibilityState !== 'visible') { saveLog(); return; } // the tab may never come back
-    requestWakeLock();
-    state.audioCtx?.resume();
-    if (state.pj && !state.pj.destroyed && state.pj.disconnected) { state.netRetry = 0; scheduleReconnect(); }
+    if (document.visibilityState !== 'visible') {
+      note('app hidden (screen off or switched app)');
+      state.hiddenAt = Date.now();
+      saveLog(); // the tab may never come back
+      saveLastMatch();
+      return;
+    }
+    const hiddenFor = state.hiddenAt ? Date.now() - state.hiddenAt : 0;
+    note(`app back on screen after ${Math.round(hiddenFor / 1000)}s`);
+    onBackOnScreen(hiddenFor);
   });
-  window.addEventListener('pagehide', () => { broadcast({ t: 'bye' }); note('page closed'); saveLog(); });
+  window.addEventListener('pagehide', () => { broadcast({ t: 'bye' }); note('page closed'); saveLog(); saveLastMatch(); });
 }
 
 function leave() {
   note('left the match');
   saveLog();
+  clearLastMatch(); // a deliberate Leave doesn't offer a rejoin
   state.leaving = true;
   clearInterval(state.watchdog);
   stopHeadsetSupport();
@@ -1096,11 +1261,11 @@ function renderLog() {
 }
 
 function setNet(kind, text) { const el = $('#netStatus'); el.className = `net ${kind}`; el.textContent = text; }
-function showBanner(text, onTap) {
+function showBanner(text, onTap, label = 'Tap here') {
   const b = $('#banner');
   b.innerHTML = '';
   b.append(text);
-  if (onTap) { const btn = document.createElement('button'); btn.textContent = 'Tap here'; btn.onclick = onTap; b.append(btn); }
+  if (onTap) { const btn = document.createElement('button'); btn.textContent = label; btn.onclick = onTap; b.append(btn); }
   b.hidden = false;
 }
 function hideBanner() { $('#banner').hidden = true; }
@@ -1136,6 +1301,7 @@ function rosterCard({ id, name, role, micClass, micText, dotClass, statusText, o
 function renderRoster() {
   const root = $('#roster');
   if (!root || !state.me) return;
+  updatePocket();
   root.innerHTML = '';
   const meLive = isTransmitting();
   root.append(rosterCard({

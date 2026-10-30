@@ -75,7 +75,10 @@ cloudflared tunnel --url http://localhost:3000
 - **Use earbuds or a Bluetooth earpiece.** If you use the phone speaker, the other officials will hear an echo.
 - **Turn Wi-Fi off during the match.** Clubhouse Wi-Fi drops out as you run to the far side of the pitch, and the switch
   to mobile data breaks the call for a few seconds. With Wi-Fi off, phones stay on mobile data all match.
-- On iPhone, Safari stops the mic if the screen locks. The app keeps the screen on, but don't press the lock button.
+- **Use Pocket mode instead of locking the phone.** On iPhone, Safari stops the mic if the screen locks. Pocket mode
+  turns the screen black, ignores pocket taps, and keeps the call running. To unlock it, press and hold, then tap **Tap to unlock**.
+- **If the app gets closed mid-match,** reopen it and tap **Rejoin match**. You go straight back into the same seat.
+  Leave asks for confirmation, so it's hard to drop out by accident.
   **Don't use Low Power Mode**: it forces the screen to lock after 30 seconds. Lower the brightness to save battery instead.
 - On Android, set Chrome's battery use to **Unrestricted** (Settings → Apps → Chrome → Battery), so Android doesn't
   throttle it mid-match.
