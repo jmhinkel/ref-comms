@@ -13,15 +13,26 @@ const MIME = {
   '.json': 'application/json', '.webmanifest': 'application/manifest+json',
 };
 
-// Run the real Netlify function so local testing exercises the same relay logic as production.
+// Run the real Netlify functions so local testing exercises the same code as production.
+// The lobby stores its data in .data/lobby/ locally instead of Netlify Blobs.
 const configFunction = import('./netlify/functions/config.mjs').then(m => m.default);
+const lobbyFunction = import('./netlify/functions/lobby.mjs').then(m => m.default);
+
+async function sendResponse(res, response) {
+  res.writeHead(response.status, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
+  res.end(await response.text());
+}
 
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
-  if (url.pathname === '/config.json') {
-    const response = await (await configFunction)();
-    res.writeHead(response.status, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
-    return res.end(await response.text());
+  if (url.pathname === '/config.json') return sendResponse(res, await (await configFunction)());
+  if (url.pathname === '/api/lobby' || url.pathname.startsWith('/api/lobby/')) {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const request = new Request(`http://localhost${req.url}`, {
+      method: req.method, headers: req.headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : Buffer.concat(chunks),
+    });
+    return sendResponse(res, await (await lobbyFunction)(request));
   }
   const file = path.normalize(path.join(PUBLIC, url.pathname === '/' ? 'index.html' : url.pathname));
   if (!file.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }

@@ -32,7 +32,26 @@
       <button type="button" id="rejoinDismiss" class="ghost">Not now</button>
     </section>
 
+    <section id="lobby" class="card lobby">
+      <div class="lobby-head">
+        <h2>Games</h2>
+        <button type="button" id="lobbyRefresh" class="ghost small">Refresh</button>
+      </div>
+      <div id="lobbyList" class="lobby-list"><p class="lobby-empty">Loading games…</p></div>
+      <button type="button" id="createGameBtn" class="secondary">+ List a game</button>
+    </section>
+
     <form id="joinForm" class="card" autocomplete="off">
+      <div id="selectedGame" class="selected-game" hidden>
+        <div>
+          <span class="label">Joining</span>
+          <b id="selectedTitle"></b>
+          <span id="selectedMeta"></span>
+        </div>
+        <button type="button" id="clearGame" class="ghost small">Change</button>
+      </div>
+      <p id="selectedNote" class="selected-note" hidden></p>
+
       <label>Your name
         <input id="name" required maxlength="30" placeholder="e.g. Jay">
       </label>
@@ -48,9 +67,9 @@
         </select>
       </label>
 
-      <label>Match code
+      <label><span id="codeLabelText">Match code</span>
         <div class="row">
-          <input id="code" required maxlength="8" placeholder="ABCD" autocapitalize="characters" spellcheck="false">
+          <input id="code" required maxlength="8" placeholder="ABC123" autocapitalize="characters" spellcheck="false">
           <button type="button" id="newCode" class="secondary">New match</button>
         </div>
       </label>
@@ -70,7 +89,7 @@
       <button type="button" id="clearLogs" class="ghost">Clear logs</button>
     </section>
 
-    <p class="hint">Referee: tap <b>New match</b>, join, then show the QR code to your ARs. Use earbuds — speaker audio will feed back into the mic.</p>
+    <p class="hint">Referee: tap <b>List a game</b> so your crew can find it, then give them the match code (or show the QR code once you've joined). Use earbuds — speaker audio will feed back into the mic.</p>
   </main>
 
   <!-- Live -->
@@ -106,9 +125,31 @@
     </section>
   </main>
 
+  <!-- List a game -->
+  <dialog id="createDlg">
+    <h2>List a game</h2>
+    <form id="createForm" class="create-form" autocomplete="off">
+      <label>Home team <input id="cgHome" required maxlength="40" placeholder="e.g. Ashland"></label>
+      <label>Away team <input id="cgAway" required maxlength="40" placeholder="e.g. Wooster"></label>
+      <label>Kickoff <input id="cgKickoff" type="datetime-local" required></label>
+      <label><span>Ground <span class="optional">(optional)</span></span> <input id="cgVenue" maxlength="60" placeholder="e.g. Riverside Park"></label>
+      <div class="code-preview">
+        <div><span class="label">Match code</span><b id="cgCode"></b></div>
+        <button type="button" id="cgNewCode" class="ghost small">New code</button>
+      </div>
+      <p class="create-hint">Everyone who opens Ref Comms will see the game. Only people you give the code to can join the audio.</p>
+      <p id="cgError" class="error" hidden></p>
+      <div class="row">
+        <button type="submit" class="primary" id="cgSubmit">List game</button>
+        <button type="button" id="cgCancel" class="secondary">Cancel</button>
+      </div>
+    </form>
+  </dialog>
+
   <!-- Share dialog -->
   <dialog id="shareDlg">
     <h2>Join this match</h2>
+    <p id="shareGame" class="share-game" hidden></p>
     <div id="qr" class="qr"></div>
     <p class="big-code" id="shareCode"></p>
     <p id="shareUrl" class="url"></p>
@@ -116,6 +157,7 @@
       <button id="nativeShare" class="primary">Share link</button>
       <button id="copyLink" class="secondary">Copy</button>
     </div>
+    <button id="endGameBtn" class="ghost wide" hidden>Remove from game list</button>
     <form method="dialog"><button class="ghost wide">Close</button></form>
   </dialog>
 

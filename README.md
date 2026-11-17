@@ -11,6 +11,23 @@ referee, ARs, TMO and 4th official can all hear each other. No app install, no a
 - **Keeps the screen awake** (Wake Lock), so the browser isn't suspended.
 - Up to 8 people per match.
 
+## Game list
+
+The start screen lists today's and upcoming games, so officials can see their match is set up.
+
+- **Referee:** tap **List a game**, then enter the teams, kickoff and ground. The app makes a 6-character match code.
+  Give the code to your crew, or show the QR code after you join.
+- **Everyone else:** tap the game, enter the code, and join. A wrong code is rejected. Too many wrong guesses lock that
+  game for 15 minutes.
+- The public list never shows the code or anyone's name. It only shows which roles are connected, for example
+  **LIVE · REF AR1**.
+- Only the phone that listed a game can remove it (share screen → **Remove from game list**). Removing it doesn't
+  disconnect anyone. Games also drop off the list by themselves after the match.
+- You can still join an unlisted match with just a code.
+
+Games are stored in Netlify Blobs (`netlify/functions/lobby.mjs`, logic in `src/lobby.mjs`). Locally they're stored in `.data/`.
+Run `npm test` for the lobby tests.
+
 ## How it works
 
 The site is fully static: HTML/CSS/JS in `public/`, plus one tiny Netlify function.

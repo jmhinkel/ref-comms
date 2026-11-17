@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-10-29';
+const APP_VERSION = '2026-11-16';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -60,7 +60,7 @@ const state = {
 // ---------- utilities ----------
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const seatId = slot => `${ID_PREFIX}${state.room}-${slot}`;
-function makeCode(n = 4) {
+function makeCode(n = 6) { // 6 characters: ~900 million combinations, so codes can't be guessed
   const buf = crypto.getRandomValues(new Uint8Array(n));
   return [...buf].map(b => CODE_ALPHABET[b % CODE_ALPHABET.length]).join('');
 }
@@ -70,7 +70,7 @@ function initials(name) {
 function roleAbbrev(role) {
   return { 'Referee': 'REF', 'AR 1': 'AR1', 'AR 2': 'AR2', '4th Official': '4TH', 'Assessor': 'ASR' }[role] || role.slice(0, 3).toUpperCase();
 }
-function shareUrl() { return `${location.origin}/?m=${state.room}`; }
+function shareUrl() { return `${location.origin}/?m=${state.room}${state.game ? `&g=${state.game.id}` : ''}`; }
 const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const nameOf = p => p.info?.name || `seat ${p.id.split('-').pop()}`;
 const audioUp = p => p.call?.peerConnection?.connectionState === 'connected';
@@ -165,12 +165,14 @@ function initJoin() {
   $('#name').value = localStorage.getItem('rc.name') || '';
   const savedRole = localStorage.getItem('rc.role');
   if (savedRole) $('#role').value = savedRole;
-  const fromLink = new URLSearchParams(location.search).get('m');
-  if (fromLink) $('#code').value = fromLink.toUpperCase();
+  const params = new URLSearchParams(location.search);
+  if (params.get('m')) $('#code').value = params.get('m').toUpperCase();
+  state.pendingGameId = params.get('g'); // a share link names the game; select it once the list loads
   syncListenOnly();
 
   $('#role').addEventListener('change', syncListenOnly);
   $('#newCode').addEventListener('click', () => { $('#code').value = makeCode(); });
+  setupLobby();
   $('#code').addEventListener('input', e => { e.target.value = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''); });
   $('#joinForm').addEventListener('submit', e => { e.preventDefault(); join(); });
 
@@ -207,6 +209,189 @@ async function showMicTip() {
     status.onchange = update;
   } catch { /* Permissions API can't query the mic in this browser */ }
 }
+// ---------- game lobby ----------
+// A public list of games so officials can see their match is set up. Selecting one still needs
+// the match code (checked by the server) before anyone can join the audio.
+const gameTitle = g => `${g.home} vs ${g.away}`;
+
+function gameWhen(g) {
+  const k = new Date(g.kickoff), today = new Date();
+  const tomorrow = new Date(today.getTime() + 864e5);
+  const day = k.toDateString() === today.toDateString() ? 'Today'
+    : k.toDateString() === tomorrow.toDateString() ? 'Tomorrow'
+    : k.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+  return `${day} ${k.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+}
+
+// Listing a game gives this phone a private token that lets it remove the game later.
+function loadManageTokens() {
+  try { return JSON.parse(localStorage.getItem('rc.manage')) || {}; } catch { return {}; }
+}
+function saveManageTokens(tokens) {
+  try { localStorage.setItem('rc.manage', JSON.stringify(tokens)); } catch { /* storage unavailable */ }
+}
+
+function postJSON(url, body, extra = {}) {
+  return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), ...extra });
+}
+
+function setupLobby() {
+  $('#lobbyRefresh').addEventListener('click', loadLobby);
+  $('#createGameBtn').addEventListener('click', openCreateGame);
+  $('#clearGame').addEventListener('click', clearSelectedGame);
+  $('#cgNewCode').addEventListener('click', () => { $('#cgCode').textContent = makeCode(6); });
+  $('#cgCancel').addEventListener('click', () => $('#createDlg').close());
+  $('#createForm').addEventListener('submit', e => { e.preventDefault(); createGame(); });
+  loadLobby();
+  state.lobbyTimer = setInterval(loadLobby, 30000);
+}
+
+async function loadLobby() {
+  if (state.me) { clearInterval(state.lobbyTimer); return; } // already in a match
+  try {
+    const res = await fetch('/api/lobby', { cache: 'no-store' });
+    if (!res.ok) throw new Error(res.status);
+    state.lobbyGames = (await res.json()).games || [];
+    state.lobbyError = false;
+  } catch {
+    state.lobbyError = true;
+  }
+  if (state.selectedGame) {
+    // Keep the selection's live status fresh; drop it if the game was removed.
+    const fresh = state.lobbyGames?.find(g => g.id === state.selectedGame.id);
+    if (fresh) state.selectedGame = fresh;
+  }
+  if (state.pendingGameId) {
+    const g = state.lobbyGames?.find(x => x.id === state.pendingGameId);
+    state.pendingGameId = null;
+    if (g) selectGame(g, { keepCode: true });
+  }
+  renderLobby();
+}
+
+function renderLobby() {
+  const list = $('#lobbyList');
+  const games = state.lobbyGames || [];
+  list.innerHTML = '';
+  if (!games.length) {
+    list.innerHTML = state.lobbyError
+      ? '<p class="lobby-empty">Couldn\'t load the game list. You can still join with a match code below.</p>'
+      : '<p class="lobby-empty">No games listed yet. Referees: tap <b>List a game</b> below.</p>';
+    return;
+  }
+  const mine = loadManageTokens();
+  for (const g of games) {
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'game-row' + (state.selectedGame?.id === g.id ? ' selected' : '');
+    row.innerHTML = '<div class="game-main"><b></b><span class="game-meta"></span></div><span class="game-status"></span>';
+    row.querySelector('b').textContent = gameTitle(g);
+    row.querySelector('.game-meta').textContent = [gameWhen(g), g.venue, mine[g.id] ? 'listed by you' : ''].filter(Boolean).join(' · ');
+    const status = row.querySelector('.game-status');
+    if (g.live.length) {
+      status.classList.add('live');
+      status.textContent = `LIVE · ${g.live.map(roleAbbrev).join(' ')}`;
+    } else {
+      status.textContent = 'No one on yet';
+    }
+    row.addEventListener('click', () => selectGame(g, { focus: true }));
+    list.append(row);
+  }
+}
+
+function selectGame(g, { focus = false, keepCode = false } = {}) {
+  if (state.selectedGame?.id !== g.id && !keepCode) $('#code').value = '';
+  state.selectedGame = g;
+  $('#selectedGame').hidden = false;
+  $('#selectedTitle').textContent = gameTitle(g);
+  $('#selectedMeta').textContent = [gameWhen(g), g.venue].filter(Boolean).join(' · ');
+  $('#codeLabelText').textContent = loadManageTokens()[g.id] ? 'Match code' : 'Match code (ask your referee)';
+  $('#newCode').hidden = true;
+  showJoinError('');
+  renderLobby();
+  if (focus) {
+    $('#joinForm').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => ($('#name').value ? $('#code') : $('#name')).focus(), 350);
+  }
+}
+
+function clearSelectedGame() {
+  state.selectedGame = null;
+  $('#selectedGame').hidden = true;
+  $('#selectedNote').hidden = true;
+  $('#codeLabelText').textContent = 'Match code';
+  $('#newCode').hidden = false;
+  renderLobby();
+}
+
+function openCreateGame() {
+  $('#cgError').hidden = true;
+  // Default kickoff: the next half hour, at least an hour from now.
+  const k = new Date(Date.now() + 3600e3);
+  k.setMinutes(k.getMinutes() <= 30 ? 30 : 60, 0, 0);
+  $('#cgKickoff').value = new Date(k.getTime() - k.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  $('#cgCode').textContent = makeCode(6);
+  $('#createDlg').showModal();
+  $('#cgHome').focus();
+}
+
+async function createGame() {
+  const btn = $('#cgSubmit');
+  const code = $('#cgCode').textContent;
+  const game = {
+    home: $('#cgHome').value.trim(), away: $('#cgAway').value.trim(), venue: $('#cgVenue').value.trim(),
+    kickoff: new Date($('#cgKickoff').value).toISOString(),
+  };
+  btn.disabled = true; btn.textContent = 'Listing…';
+  try {
+    const res = await postJSON('/api/lobby', { ...game, code });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || 'Couldn\'t list the game. Try again.');
+    saveManageTokens({ ...loadManageTokens(), [data.id]: data.manageToken });
+    $('#createDlg').close();
+    $('#createForm').reset();
+    await loadLobby();
+    selectGame(state.lobbyGames?.find(g => g.id === data.id) || { id: data.id, ...game, live: [] }, { focus: true });
+    $('#code').value = code;
+    $('#role').value = 'Referee';
+    syncListenOnly();
+    const noteEl = $('#selectedNote');
+    noteEl.textContent = `Listed. Your match code is ${code}. Give it to your crew, or show them the QR code after you join.`;
+    noteEl.hidden = false;
+  } catch (err) {
+    $('#cgError').textContent = err.message;
+    $('#cgError').hidden = false;
+  } finally {
+    btn.disabled = false; btn.textContent = 'List game';
+  }
+}
+
+// While in a listed game, check in every minute so the lobby shows which roles are on.
+// The server only accepts check-ins that carry the right match code.
+function lobbyCheckIn(gone = false) {
+  if (!state.game || !state.slot || !state.me) return;
+  state.lobbySeen = Date.now();
+  postJSON(`/api/lobby/${state.game.id}/presence`, { code: state.room, seat: state.slot, role: state.me.role, gone }, { keepalive: true })
+    .catch(() => { /* the lobby is a nice-to-have; audio doesn't depend on it */ });
+}
+
+async function endListedGame() {
+  if (!state.game) return;
+  if (!confirm('Remove this game from the public list? Anyone already connected stays connected.')) return;
+  const tokens = loadManageTokens();
+  try {
+    const res = await postJSON(`/api/lobby/${state.game.id}/end`, { manageToken: tokens[state.game.id] });
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'Couldn\'t remove the game.');
+    delete tokens[state.game.id];
+    saveManageTokens(tokens);
+    note(`removed ${gameTitle(state.game)} from the game list`);
+    state.game = null;
+    $('#shareDlg').close();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
 // ---------- one-tap rejoin ----------
 // Whatever match this phone was last in (and didn't Leave) is remembered, so if the tab is closed,
 // reloaded or crashes, the join screen offers a single button to get straight back into the same seat.
@@ -225,7 +410,7 @@ function saveLastMatch() {
   try {
     localStorage.setItem(LAST_MATCH, JSON.stringify({
       room: state.room, name: state.me.name, role: state.me.role,
-      listenOnly: !state.localTrack, slot: state.slot || 0, at: Date.now(),
+      listenOnly: !state.localTrack, slot: state.slot || 0, at: Date.now(), game: state.game || null,
     }));
   } catch { /* storage unavailable */ }
 }
@@ -237,7 +422,7 @@ function showRejoin() {
   const m = loadLastMatch();
   if (!m) return;
   const mins = Math.round((Date.now() - m.at) / 60000);
-  $('#rejoinTitle').textContent = `Rejoin match ${m.room}`;
+  $('#rejoinTitle').textContent = m.game ? `Rejoin ${gameTitle(m.game)}` : `Rejoin match ${m.room}`;
   $('#rejoinSub').textContent = `As ${m.name} · ${m.role}${m.listenOnly ? ' (listen only)' : ''} · ${mins < 1 ? 'just now' : `${mins} min ago`}`;
   $('#rejoin').hidden = false;
   $('#rejoinBtn').onclick = () => {
@@ -246,6 +431,7 @@ function showRejoin() {
     $('#code').value = m.room;
     $('#listenOnly').checked = !!m.listenOnly;
     state.rejoinSlot = m.slot;
+    if (m.game) selectGame(m.game, { keepCode: true }); else clearSelectedGame();
     $('#rejoin').hidden = true;
     join(); // still inside the tap, which iOS needs for audio
   };
@@ -276,7 +462,21 @@ async function join() {
     state.audioCtx.resume();
     startHeadsetSupport(); // also needs the tap, so it goes before any await
 
-    const cfg = await fetch('/config.json').then(r => r.json()).catch(() => null);
+    // For a listed game, the server checks the code before we go any further. If the lobby itself
+    // can't be reached, let them in anyway — the audio doesn't depend on it.
+    const game = state.selectedGame;
+    const [cfg, check] = await Promise.all([
+      fetch('/config.json').then(r => r.json()).catch(() => null),
+      game
+        ? postJSON(`/api/lobby/${game.id}/verify`, { code: room })
+          .then(async r => ({ status: r.status, ...(await r.json().catch(() => ({}))) }))
+          .catch(() => ({ status: 0 }))
+        : null,
+    ]);
+    if (check && (check.status === 403 || check.status === 429)) {
+      throw Object.assign(new Error(check.error), { name: 'CodeRejected' });
+    }
+    state.game = game && (check.status === 200 || check.status === 0) ? game : null; // 404: no longer listed
     if (cfg?.hasTurn) state.iceServers = cfg.iceServers;
     state.relayProvider = cfg?.hasTurn ? cfg.provider : null;
     state.relayError = cfg?.error || null;
@@ -288,8 +488,11 @@ async function join() {
     }
   } catch (err) {
     stopHeadsetSupport();
+    state.audioCtx?.close().catch(() => {});
+    state.audioCtx = null;
     showRejoin();
     btn.disabled = false; btn.textContent = 'Join match';
+    if (err.name === 'CodeRejected') { showJoinError(err.message); $('#code').focus(); return; }
     const denied = err && (err.name === 'NotAllowedError' || err.name === 'SecurityError');
     showJoinError(denied
       ? `Microphone permission was blocked. ${micSettingsHelp()} Or tick "Listen only".`
@@ -303,12 +506,14 @@ async function join() {
   state.me = { name, role };
   state.room = room;
   saveLastMatch();
-  history.replaceState(null, '', `/?m=${room}`);
+  clearInterval(state.lobbyTimer);
+  if (state.game) note(`listed game: ${gameTitle(state.game)}`);
+  history.replaceState(null, '', `/?m=${room}${state.game ? `&g=${state.game.id}` : ''}`);
 
   $('#join').hidden = true;
   $('#live').hidden = false;
   $('#codeLabel').textContent = room;
-  if (window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: `Ref Comms · Match ${room}`, artist: `${name} · ${role}` });
+  if (window.MediaMetadata) navigator.mediaSession.metadata = new MediaMetadata({ title: `Ref Comms · ${state.game ? gameTitle(state.game) : `Match ${room}`}`, artist: `${name} · ${role}` });
   setupLiveControls();
   applyTransmit();
   requestWakeLock();
@@ -387,6 +592,7 @@ function watchdog() {
   if (state.localTrack?.readyState === 'ended') recoverMic();
   if (document.visibilityState === 'visible' && (!state.wakeLock || state.wakeLock.released)) requestWakeLock();
   if (Date.now() - (state.lastMatchSaved || 0) > 60000) saveLastMatch(); // keep "rejoin" fresh
+  if (Date.now() - (state.lobbySeen || 0) > 60000) lobbyCheckIn();     // keep the lobby's LIVE badge fresh
 }
 
 // The screen was off (or another app was in front). Don't wait for the next watchdog pass:
@@ -546,6 +752,7 @@ async function tryAllSeats() {
       hideBanner();
       onSeated();
       saveLastMatch(); // now with the seat number, so a rejoin reclaims the same seat
+      lobbyCheckIn();
       return 'ok';
     }
     if (result === 'error') return 'error';
@@ -1167,6 +1374,7 @@ function setupLiveControls() {
     else copyLink();
   });
   $('#copyLink').addEventListener('click', copyLink);
+  $('#endGameBtn').addEventListener('click', endListedGame);
 
   $('#netStatus').addEventListener('click', () => { renderLog(); $('#logDlg').showModal(); });
   $('#reconnectBtn').addEventListener('click', () => { $('#logDlg').close(); reconnectAll(); });
@@ -1194,6 +1402,7 @@ function leave() {
   note('left the match');
   saveLog();
   clearLastMatch(); // a deliberate Leave doesn't offer a rejoin
+  lobbyCheckIn(true); // and the lobby stops counting this phone straight away
   state.leaving = true;
   clearInterval(state.watchdog);
   stopHeadsetSupport();
@@ -1211,6 +1420,9 @@ function leave() {
 function openShare() {
   const url = shareUrl();
   $('#shareCode').textContent = state.room;
+  $('#shareGame').hidden = !state.game;
+  if (state.game) $('#shareGame').textContent = `${gameTitle(state.game)} · ${gameWhen(state.game)}`;
+  $('#endGameBtn').hidden = !(state.game && loadManageTokens()[state.game.id]);
   $('#shareUrl').textContent = url.replace(/^https?:\/\//, '');
   if (window.qrcode) {
     const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
