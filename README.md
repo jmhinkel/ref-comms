@@ -4,7 +4,9 @@ Phone-based radio for rugby match officials. Open a web page, enter a match code
 referee, ARs, TMO and 4th official can all hear each other. No app install, no accounts, no hardware.
 
 - **Audio goes phone-to-phone** (WebRTC, Opus codec, ~200 ms latency).
-- **Open mic or push-to-talk**, chosen per person. Tap to mute in open-mic mode.
+- **Open mic or push-to-talk**, chosen per person and remembered per role. Tap to mute in open-mic mode.
+- **ARs start in push-to-talk.** One press of the headset's play/pause button (for example on Shokz) opens the mic for
+  5 seconds, then it mutes itself, so the referee isn't hearing crowd and wind from open AR mics all match.
 - **Listen-only seats** for assessors or coaches, with no mic.
 - **QR code / share link** so the referee can get ARs joined in seconds.
 - **Survives blips**: a reload takes back the same seat, and dropped links are re-dialled automatically.

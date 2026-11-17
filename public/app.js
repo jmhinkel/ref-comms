@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-11-16';
+const APP_VERSION = '2026-11-16.2';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -42,7 +42,7 @@ const state = {
   localStream: null,
   localTrack: null,
   outStream: null,         // mic stream, or silence for listen-only seats
-  mode: localStorage.getItem('rc.mode') || 'open',  // 'open' | 'ptt'
+  mode: 'open',            // 'open' | 'ptt' — set per role when joining (see modeFor)
   muted: false,
   pttDown: false,
   burstUntil: 0,           // headset-triggered talk window (push-to-talk mode)
@@ -441,6 +441,24 @@ function showRejoin() {
 function syncListenOnly() {
   const opt = $('#role').selectedOptions[0];
   if (opt.hasAttribute('data-listen')) $('#listenOnly').checked = true;
+  // Tell ARs how they'll talk before they join.
+  const ptt = modeFor(opt.value) === 'ptt' && !opt.hasAttribute('data-listen');
+  $('#roleHint').hidden = !ptt;
+  if (ptt) $('#roleHint').textContent = `You'll start in push to talk: press play/pause on your headset (e.g. Shokz) to talk for ${HEADSET_TALK_MS / 1000} seconds, then it mutes itself. You can switch to open mic once you're in.`;
+}
+
+// Mic mode is remembered per role, and ARs default to push to talk so the referee only hears
+// them when they mean to speak — no crowd, wind or breathing on an open mic all match.
+const PTT_ROLES = ['AR 1', 'AR 2'];
+function modeFor(role) {
+  try {
+    const saved = localStorage.getItem(`rc.mode.${role}`);
+    if (saved === 'open' || saved === 'ptt') return saved;
+  } catch { /* storage unavailable */ }
+  return PTT_ROLES.includes(role) ? 'ptt' : 'open';
+}
+function saveModeFor(role, mode) {
+  try { localStorage.setItem(`rc.mode.${role}`, mode); } catch { /* storage unavailable */ }
 }
 function showJoinError(msg) { const el = $('#joinError'); el.textContent = msg; el.hidden = !msg; }
 
@@ -505,6 +523,8 @@ async function join() {
 
   state.me = { name, role };
   state.room = room;
+  state.mode = modeFor(role);
+  if (state.localTrack) note(`mic mode: ${state.mode === 'ptt' ? `push to talk (headset button = ${HEADSET_TALK_MS / 1000} s)` : 'open mic'}`);
   saveLastMatch();
   clearInterval(state.lobbyTimer);
   if (state.game) note(`listed game: ${gameTitle(state.game)}`);
@@ -1216,7 +1236,7 @@ function renderTalk() {
     $('#talkLabel').textContent = talking ? 'TALKING' : 'HOLD';
     $('#talkSub').textContent = state.pttDown ? 'Release to stop'
       : state.burstUntil ? `Headset · ${Math.max(1, Math.ceil((state.burstUntil - Date.now()) / 1000))}s left`
-      : 'Hold to talk';
+      : `Hold here, or press your headset button (${HEADSET_TALK_MS / 1000}s)`;
   }
   document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === state.mode));
 }
@@ -1354,7 +1374,8 @@ function setupLiveControls() {
   document.querySelectorAll('.mode button').forEach(b => b.addEventListener('click', () => {
     endBurst(false);
     state.mode = b.dataset.mode; state.pttDown = false; state.muted = false;
-    localStorage.setItem('rc.mode', state.mode);
+    saveModeFor(state.me.role, state.mode);
+    note(`mic mode: ${state.mode === 'ptt' ? 'push to talk' : 'open mic'}`);
     applyTransmit();
   }));
 

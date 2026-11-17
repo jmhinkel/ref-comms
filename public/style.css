@@ -107,6 +107,7 @@ button.small { padding: 8px 10px; font-size: .9rem; }
 .selected-game .label { color: var(--green); font-size: .7rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
 .selected-game b { font-size: 1.1rem; }
 .selected-game span:not(.label) { color: var(--muted); font-size: .85rem; }
+.role-hint { margin: -6px 2px 0; color: var(--muted); font-size: .85rem; line-height: 1.45; }
 .selected-note { margin: 0; padding: 10px 12px; border-radius: 10px; background: #0f2338; color: var(--blue); font-size: .9rem; line-height: 1.45; }
 
 .create-form { display: flex; flex-direction: column; gap: 12px; }
