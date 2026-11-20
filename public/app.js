@@ -16,9 +16,11 @@ const RESCAN_MS = 6000;    // how often to look for officials we're not linked t
 const STUCK_MS = 5000;     // audio "disconnected" this long → rebuild instead of waiting it out
 const QUALITY_MS = 10000;  // how often to sample packet loss / delay per official
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
-const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
+const VAD_POLL_MS = 30;    // voice-activated mic: how often to check the speaking level
+const VAD_HANG_MS = 1200;  // ...and how long it stays open after you stop, so sentences aren't chopped
+const VAD_SENS = { low: 16, normal: 11, high: 7 }; // dB above the background noise needed to open
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-11-20.2';
+const APP_VERSION = '2026-11-20.3';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -42,11 +44,10 @@ const state = {
   localStream: null,
   localTrack: null,
   outStream: null,         // mic stream, or silence for listen-only seats
-  mode: 'open',            // 'open' | 'ptt' — set per role when joining (see modeFor)
+  mode: 'open',            // 'open' | 'voice' — set per role when joining (see modeFor)
   muted: false,
-  pttDown: false,
-  burstUntil: 0,           // headset-triggered talk window (push-to-talk mode)
-  burstTick: null,
+  vad: null,               // voice-activated mic detector, while in 'voice' mode (see startVad)
+  vadSens: (() => { try { return localStorage.getItem('rc.vadSens') || 'normal'; } catch { return 'normal'; } })(),
   lastHeadset: 0,
   headsetSeen: null,       // last headset action received, shown so officials can test their buttons
   keepAlive: null,         // silent looping <audio> that keeps the page's media session active
@@ -160,7 +161,7 @@ function renderPastLogs() {
   }
 }
 
-function myInfo() { return { ...state.me, listenOnly: !state.localTrack, live: isTransmitting() }; }
+function myInfo() { return { ...state.me, listenOnly: !state.localTrack, live: isTransmitting(), voice: voiceArmed() }; }
 
 // ---------- join screen ----------
 function initJoin() {
@@ -564,22 +565,24 @@ function showRejoin() {
 function syncListenOnly() {
   const opt = $('#role').selectedOptions[0];
   if (opt.hasAttribute('data-listen')) $('#listenOnly').checked = true;
-  // Tell ARs how they'll talk before they join.
-  const ptt = modeFor(opt.value) === 'ptt' && !opt.hasAttribute('data-listen');
-  $('#roleHint').hidden = !ptt;
-  if (ptt) $('#roleHint').textContent = `You'll start in push to talk: press play/pause on your headset (e.g. Shokz) to talk for ${HEADSET_TALK_MS / 1000} seconds, then it mutes itself. You can switch to open mic once you're in.`;
+  // Tell officials how they'll talk before they join.
+  const voice = modeFor(opt.value) === 'voice' && !opt.hasAttribute('data-listen');
+  $('#roleHint').hidden = !voice;
+  if (voice) $('#roleHint').textContent = "You'll start on voice activated: your mic only sends while you're speaking, so the crew doesn't hear wind and crowd. You can switch to open mic once you're in.";
 }
 
-// Mic mode is remembered per role. Every role starts on open mic for now (Jay's call, Nov 2026);
-// add a role here to have it start in push to talk instead, e.g. ['AR 1', 'AR 2'].
-const PTT_ROLES = [];
+// Mic mode is remembered per role. Every role starts on open mic (Jay's call, Nov 2026); add a role
+// here to have it start on voice activated instead, e.g. ['AR 1', 'AR 2'].
+const VOICE_ROLES = [];
 function modeFor(role) {
   try {
     const saved = localStorage.getItem(`rc.mode.${role}`);
-    if (saved === 'open' || saved === 'ptt') return saved;
+    if (saved === 'open' || saved === 'voice') return saved;
+    if (saved === 'ptt') return 'voice'; // push to talk was replaced by voice activated (Nov 2026)
   } catch { /* storage unavailable */ }
-  return PTT_ROLES.includes(role) ? 'ptt' : 'open';
+  return VOICE_ROLES.includes(role) ? 'voice' : 'open';
 }
+const modeName = () => state.mode === 'voice' ? `voice activated (${state.vadSens} sensitivity)` : 'open mic';
 function saveModeFor(role, mode) {
   try { localStorage.setItem(`rc.mode.${role}`, mode); } catch { /* storage unavailable */ }
 }
@@ -647,7 +650,8 @@ async function join() {
   state.me = { name, role };
   state.room = room;
   state.mode = modeFor(role);
-  if (state.localTrack) note(`mic mode: ${state.mode === 'ptt' ? `push to talk (headset button = ${HEADSET_TALK_MS / 1000} s)` : 'open mic'}`);
+  if (state.localTrack) note(`mic mode: ${modeName()}`);
+  syncVad();
   saveLastMatch();
   clearInterval(state.lobbyTimer);
   if (state.game) note(`listed game: ${gameTitle(state.game)}`);
@@ -678,6 +682,72 @@ function useMicStream(stream) {
   });
   track.addEventListener('mute', () => note('microphone paused by the system (call, Siri or another app?)'));
   track.addEventListener('unmute', () => note('microphone resumed'));
+  if (state.mode === 'voice') startVad(); // after a mic restart, the detector follows the new mic
+}
+
+// ---------- voice activated mic ----------
+// The mic only sends while you're speaking. A copy of the mic (which keeps listening while the real
+// one is switched off) feeds a speech-band level detector. The real mic switches on when the level
+// rises clearly above the background noise, and off again after a short pause. If the detector
+// can't be trusted (screen off, audio paused by the phone), it sends all the time rather than risk
+// cutting someone off.
+function syncVad() {
+  if (state.mode === 'voice' && state.localTrack) { if (!state.vad) startVad(); }
+  else stopVad();
+}
+
+function startVad() {
+  stopVad();
+  if (!state.localTrack || !state.audioCtx) return;
+  try {
+    const ctx = state.audioCtx;
+    const track = state.localTrack.clone();
+    track.enabled = true;
+    const src = ctx.createMediaStreamSource(new MediaStream([track]));
+    const hp = ctx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 250; // wind rumble, handling noise
+    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 3500; // hiss
+    const an = ctx.createAnalyser(); an.fftSize = 1024;
+    src.connect(hp).connect(lp).connect(an); // analysis only, nothing is played or sent from here
+    state.vad = {
+      track, a: { an, buf: new Float32Array(an.fftSize) },
+      floor: -60, level: 0, lastVoice: 0, open: false, failOpen: false,
+      timer: setInterval(vadTick, VAD_POLL_MS),
+    };
+  } catch (err) {
+    state.vad = null;
+    note(`voice activation unavailable (${err.name || err}) — mic will send all the time`);
+  }
+}
+
+function stopVad() {
+  const v = state.vad;
+  if (!v) return;
+  state.vad = null;
+  clearInterval(v.timer);
+  v.track.stop(); // stops only the copy, never the real mic
+}
+
+function vadTick() {
+  const v = state.vad;
+  if (!v || state.leaving) return;
+  const rms = level(v.a);
+  const db = 20 * Math.log10(rms + 1e-9);
+  v.level = rms;
+  // Background noise estimate: follows quiet moments quickly but rises slowly (~10 s), so steady wind
+  // or crowd noise is learnt while speech isn't.
+  v.floor += (db < v.floor ? 0.3 : 0.003) * (db - v.floor);
+  v.floor = Math.min(-30, Math.max(-75, v.floor));
+  // Needs to be clearly above the noise, but normal speech always gets through even in a loud crowd.
+  const openAt = Math.min(-24, Math.max(-52, v.floor + (VAD_SENS[state.vadSens] ?? VAD_SENS.normal)));
+  const now = Date.now();
+  const failOpen = document.hidden || state.audioCtx?.state !== 'running' || v.track.readyState !== 'live';
+  if (failOpen !== v.failOpen) {
+    v.failOpen = failOpen;
+    note(failOpen ? 'voice activation paused (screen off or audio interrupted) — sending all the time' : 'voice activation running again');
+  }
+  if (failOpen || db > openAt || (v.open && db > openAt - 5)) v.lastVoice = now;
+  const open = now - v.lastVoice < VAD_HANG_MS;
+  if (open !== v.open) { v.open = open; applyTransmit(); }
 }
 
 // Restart the mic in place and swap it into every live call — no page reload, so no new permission prompt
@@ -800,7 +870,7 @@ function updatePocket() {
   if (!state.pocket) return;
   const peers = [...state.peers.values()].filter(p => p.info);
   const up = peers.filter(audioUp).length;
-  const mic = !state.localTrack ? 'Listening' : isTransmitting() ? 'LIVE' : state.mode === 'ptt' ? 'Push to talk' : 'Muted';
+  const mic = !state.localTrack ? 'Listening' : isTransmitting() ? 'LIVE' : voiceArmed() ? 'Voice activated' : 'Muted';
   $('#pocketText').textContent = `${mic} · ${peers.length ? `${up} of ${peers.length} connected` : 'waiting for crew'}`;
   $('#pocketDot').className = `dot ${!peers.length || up === peers.length ? 'ok' : up ? 'warn' : 'bad'}`;
 }
@@ -1055,7 +1125,7 @@ function onData(dc, msg) {
       renderRoster();
       break;
     case 'state':
-      if (p.info) { p.info.live = !!msg.live; renderRoster(); }
+      if (p.info) { p.info.live = !!msg.live; p.info.voice = !!msg.voice; renderRoster(); }
       break;
     case 'redial':
       // The other phone lost our audio. If ours isn't healthy either, ring again now.
@@ -1326,13 +1396,15 @@ function level(a) {
 
 // ---------- mic control ----------
 function isTransmitting() {
-  if (!state.localTrack) return false;
-  return state.mode === 'open' ? !state.muted : (state.pttDown || state.burstUntil > 0);
+  if (!state.localTrack || state.muted) return false;
+  // Voice activated: only while speaking. If the detector couldn't start, send rather than go silent.
+  return state.mode === 'voice' ? (!state.vad || state.vad.open) : true;
 }
+const voiceArmed = () => !!state.localTrack && state.mode === 'voice' && !state.muted;
 function applyTransmit() {
   const live = isTransmitting();
   if (state.localTrack) state.localTrack.enabled = live;
-  broadcast({ t: 'state', live });
+  broadcast({ t: 'state', live, voice: voiceArmed() });
   renderRoster();
   renderTalk();
 }
@@ -1344,32 +1416,32 @@ function renderTalk() {
     $('#talkLabel').textContent = 'LISTENING';
     $('#talkSub').textContent = 'Listen-only mode';
     $('.mode').hidden = true;
+    $('#vadSens').hidden = true;
     $('#hsStatus').hidden = true;
     return;
   }
-  $('#hsStatus').textContent = state.mode === 'ptt'
-    ? `Headset button: talk for ${HEADSET_TALK_MS / 1000}s · ${headsetNote()}`
-    : `Headset button: mute / unmute · ${headsetNote()}`;
-  if (state.mode === 'open') {
-    if (state.muted) talk.classList.add('muted');
-    $('#talkLabel').textContent = state.muted ? 'MUTED' : 'LIVE';
-    $('#talkSub').textContent = state.muted ? 'Tap to go live' : 'Tap to mute';
+  const voice = state.mode === 'voice';
+  $('#hsStatus').textContent = `Headset button: mute / unmute · ${headsetNote()}`;
+  if (state.muted) {
+    talk.classList.add('muted');
+    $('#talkLabel').textContent = 'MUTED';
+    $('#talkSub').textContent = voice ? 'Tap to turn voice activation back on' : 'Tap to go live';
+  } else if (voice && !isTransmitting()) {
+    talk.classList.add('voice');
+    $('#talkLabel').textContent = 'VOICE';
+    $('#talkSub').textContent = 'Sends when you speak · tap to mute';
   } else {
-    talk.classList.add('ptt');
-    const talking = state.pttDown || state.burstUntil > 0;
-    if (talking) talk.classList.add('down');
-    $('#talkLabel').textContent = talking ? 'TALKING' : 'HOLD';
-    $('#talkSub').textContent = state.pttDown ? 'Release to stop'
-      : state.burstUntil ? `Headset · ${Math.max(1, Math.ceil((state.burstUntil - Date.now()) / 1000))}s left`
-      : `Hold here, or press your headset button (${HEADSET_TALK_MS / 1000}s)`;
+    $('#talkLabel').textContent = voice ? 'TALKING' : 'LIVE';
+    $('#talkSub').textContent = 'Tap to mute';
   }
   document.querySelectorAll('.mode button').forEach(b => b.classList.toggle('on', b.dataset.mode === state.mode));
+  $('#vadSens').hidden = !voice;
+  document.querySelectorAll('#vadSens button').forEach(b => b.classList.toggle('on', b.dataset.sens === state.vadSens));
 }
 
 // ---------- headset / AirPods button ----------
 // Headset buttons reach web pages only as media keys (play/pause etc.) via the Media Session API,
-// and only while the page is playing media — hence a silent looping track. A press is a single
-// event with no release, so push-to-talk mode opens the mic for a fixed window instead.
+// and only while the page is playing media — hence a silent looping track. A press toggles mute.
 const HEADSET_ACTIONS = ['play', 'pause', 'togglemicrophone', 'nexttrack', 'previoustrack', 'stop'];
 
 function silentWavUrl(seconds = 10, rate = 8000) {
@@ -1412,33 +1484,10 @@ function onHeadsetButton(action) {
   try { navigator.mediaSession.playbackState = 'playing'; } catch { /* older browsers */ }
   if (!state.localTrack) return renderTalk();
 
-  if (state.mode === 'ptt') {
-    startBurst(); // pressing again mid-window restarts the 5 seconds
-  } else {
-    state.muted = !state.muted;
-    applyTransmit();
-    cue(state.muted ? 'off' : 'on');
-  }
-  navigator.vibrate?.(25);
-}
-
-function startBurst() {
-  const wasTalking = state.burstUntil > 0;
-  state.burstUntil = Date.now() + HEADSET_TALK_MS;
-  clearInterval(state.burstTick);
-  state.burstTick = setInterval(() => {
-    if (Date.now() >= state.burstUntil) endBurst(true);
-    else renderTalk();
-  }, 250);
-  if (!wasTalking) applyTransmit();
-  cue('on');
-}
-function endBurst(withCue) {
-  if (!state.burstUntil) return;
-  state.burstUntil = 0;
-  clearInterval(state.burstTick);
+  state.muted = !state.muted;
   applyTransmit();
-  if (withCue) cue('off');
+  cue(state.muted ? 'off' : 'on');
+  navigator.vibrate?.(25);
 }
 
 function headsetNote() {
@@ -1465,44 +1514,37 @@ function cue(kind) {
 
 function setupLiveControls() {
   const talk = $('#talk');
-  const pttStart = e => {
-    if (state.mode !== 'ptt' || !state.localTrack) return;
-    e.preventDefault();
-    talk.setPointerCapture?.(e.pointerId);
-    endBurst(false); // a finger on the button takes over from a headset window
-    state.pttDown = true; applyTransmit();
-    navigator.vibrate?.(15);
-  };
-  const pttEnd = () => {
-    if (!state.pttDown) return;
-    state.pttDown = false; applyTransmit();
-  };
-  talk.addEventListener('pointerdown', pttStart);
-  talk.addEventListener('pointerup', pttEnd);
-  talk.addEventListener('pointercancel', pttEnd);
   talk.addEventListener('contextmenu', e => e.preventDefault());
   talk.addEventListener('click', () => {
-    if (state.mode !== 'open' || !state.localTrack) return;
+    if (!state.localTrack) return;
     state.muted = !state.muted; applyTransmit();
     navigator.vibrate?.(state.muted ? [20, 40, 20] : 25);
   });
 
-  // Spacebar = push-to-talk / mute toggle on laptops (handy for a TMO booth).
+  // Spacebar = mute toggle on laptops (handy for a TMO booth).
   document.addEventListener('keydown', e => {
-    if (e.code !== 'Space' || e.repeat || e.target.matches('input, select, textarea')) return;
+    if (e.code !== 'Space' || e.repeat || e.target.matches('input, select, textarea, button')) return;
     e.preventDefault();
-    if (state.mode === 'ptt') { state.pttDown = true; applyTransmit(); }
-    else { state.muted = !state.muted; applyTransmit(); }
+    if (!state.localTrack) return;
+    state.muted = !state.muted; applyTransmit();
   });
-  document.addEventListener('keyup', e => { if (e.code === 'Space' && state.mode === 'ptt') pttEnd(); });
 
   document.querySelectorAll('.mode button').forEach(b => b.addEventListener('click', () => {
-    endBurst(false);
-    state.mode = b.dataset.mode; state.pttDown = false; state.muted = false;
+    if (state.mode === b.dataset.mode) return;
+    state.mode = b.dataset.mode; state.muted = false;
     saveModeFor(state.me.role, state.mode);
-    note(`mic mode: ${state.mode === 'ptt' ? 'push to talk' : 'open mic'}`);
+    syncVad();
+    note(`mic mode: ${modeName()}`);
     applyTransmit();
   }));
+  document.querySelectorAll('#vadSens button').forEach(b => b.addEventListener('click', () => {
+    state.vadSens = b.dataset.sens;
+    try { localStorage.setItem('rc.vadSens', state.vadSens); } catch { /* storage unavailable */ }
+    note(`voice activation sensitivity: ${state.vadSens}`);
+    renderTalk();
+  }));
+  // Screen going off: switch the voice mic to "always send" straight away, before the phone slows timers.
+  document.addEventListener('visibilitychange', () => vadTick());
 
   $('#leaveBtn').addEventListener('click', () => {
     if (confirm('Leave the match? The rest of the crew will lose you until you rejoin.')) leave();
@@ -1554,6 +1596,7 @@ function leave() {
   state.leaving = true;
   clearInterval(state.watchdog);
   stopHeadsetSupport();
+  stopVad();
   broadcast({ t: 'bye' });
   state.timers.forEach(clearInterval);
   for (const id of [...state.peers.keys()]) removePeer(id);
@@ -1670,8 +1713,8 @@ function renderRoster() {
   const meLive = isTransmitting();
   root.append(rosterCard({
     id: 'me', name: `${state.me.name} (you)`, role: state.me.role,
-    micClass: !state.localTrack ? 'listen' : meLive ? 'live' : 'muted',
-    micText: !state.localTrack ? 'LISTEN' : meLive ? 'LIVE' : state.mode === 'ptt' ? 'PTT' : 'MUTED',
+    micClass: !state.localTrack ? 'listen' : meLive ? 'live' : voiceArmed() ? 'voice' : 'muted',
+    micText: !state.localTrack ? 'LISTEN' : meLive ? 'LIVE' : voiceArmed() ? 'VOICE' : 'MUTED',
     dotClass: state.pj && !state.pj.disconnected ? 'ok' : 'warn', statusText: 'This phone',
   }));
 
@@ -1682,8 +1725,8 @@ function renderRoster() {
     const [dotClass, statusText] = peerStatus(p);
     root.append(rosterCard({
       id: p.id, name: p.info.name, role: p.info.role,
-      micClass: p.info.listenOnly ? 'listen' : p.info.live ? 'live' : 'muted',
-      micText: p.info.listenOnly ? 'LISTEN' : p.info.live ? 'LIVE' : 'MUTED',
+      micClass: p.info.listenOnly ? 'listen' : p.info.live ? 'live' : p.info.voice ? 'voice' : 'muted',
+      micText: p.info.listenOnly ? 'LISTEN' : p.info.live ? 'LIVE' : p.info.voice ? 'VOICE' : 'MUTED',
       dotClass, statusText, offline: p.stale, speaking: p.speaking,
     }));
   }
@@ -1698,9 +1741,11 @@ function renderRoster() {
 // Speaking rings + mic meter. Runs every frame but only touches classes that change.
 function meterLoop() {
   if (state.leaving) return;
-  const myLevel = isTransmitting() ? level(state.localAnalyser) : 0;
+  // Voice activated: show the detector's level even while the mic is holding back, so you can see it hears you.
+  const v = voiceArmed() ? state.vad : null;
+  const myLevel = v ? v.level * 1.6 : isTransmitting() ? level(state.localAnalyser) : 0;
   $('#meterFill').style.height = `${Math.min(100, myLevel * 400)}%`;
-  document.querySelector('.official[data-id="me"]')?.classList.toggle('speaking', myLevel > SPEAKING_THRESHOLD);
+  document.querySelector('.official[data-id="me"]')?.classList.toggle('speaking', isTransmitting() && (!!v || myLevel > SPEAKING_THRESHOLD));
   for (const p of state.peers.values()) {
     const speaking = level(p.analyser) > SPEAKING_THRESHOLD;
     if (speaking !== p.speaking) {

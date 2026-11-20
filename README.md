@@ -4,9 +4,12 @@ Phone-based radio for rugby match officials. Open a web page, enter a match code
 referee, ARs, TMO and 4th official can all hear each other. No app install, no accounts, no hardware.
 
 - **Audio goes phone-to-phone** (WebRTC, Opus codec, ~200 ms latency).
-- **Open mic or push-to-talk**, chosen per person and remembered per role. Tap to mute in open-mic mode.
-- **Headset push-to-talk.** Everyone starts on open mic. In push-to-talk mode, one press of the headset's play/pause button
-  (for example on Shokz) opens the mic for 5 seconds, then it mutes itself. In open-mic mode the same button mutes or unmutes.
+- **Open mic or voice activated**, chosen per person and remembered per role. Everyone starts on open mic.
+  Voice activated only sends while you're speaking, so the crew doesn't hear your wind, breathing and crowd
+  between calls. It has a Low / Normal / High sensitivity setting (Low for windy or noisy grounds). While the
+  screen is off or the phone pauses audio, it sends all the time instead, so nobody is ever cut off.
+  (Voice activated replaced push-to-talk in Nov 2026.)
+- **Headset button** (for example play/pause on Shokz) mutes or unmutes, in either mode. So does tapping the big button.
 - **Listen-only seats** for assessors or coaches, with no mic.
 - **QR code / share link** so the referee can get ARs joined in seconds.
 - **Survives blips**: a reload takes back the same seat, and dropped links are re-dialled automatically.
@@ -108,4 +111,4 @@ cloudflared tunnel --url http://localhost:3000
   throttle it mid-match.
 - If audio is choppy or drops, tap the status label → **Copy log**. It records signal quality every 30 seconds.
 - Pick an unusual match code (the **New match** button does this). Anyone who has the code can join.
-- Keyboard: on a laptop (for example in a TMO booth), Space is push-to-talk / mute.
+- Keyboard: on a laptop (for example in a TMO booth), Space mutes / unmutes.

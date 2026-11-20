@@ -116,7 +116,13 @@
       </button>
       <div class="mode" role="radiogroup" aria-label="Mic mode">
         <button data-mode="open" class="on" role="radio">Open mic</button>
-        <button data-mode="ptt" role="radio">Push to talk</button>
+        <button data-mode="voice" role="radio">Voice activated</button>
+      </div>
+      <div id="vadSens" class="sens" role="radiogroup" aria-label="Voice activation sensitivity" hidden>
+        <span>Sensitivity</span>
+        <button data-sens="low" role="radio" title="Needs a louder voice: windy or noisy grounds">Low</button>
+        <button data-sens="normal" role="radio">Normal</button>
+        <button data-sens="high" role="radio" title="Picks up quieter speech: calm days">High</button>
       </div>
       <p id="hsStatus" class="hs"></p>
       <button id="talk" class="talk">
