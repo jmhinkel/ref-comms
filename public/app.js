@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-11-16.2';
+const APP_VERSION = '2026-11-20';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -447,9 +447,9 @@ function syncListenOnly() {
   if (ptt) $('#roleHint').textContent = `You'll start in push to talk: press play/pause on your headset (e.g. Shokz) to talk for ${HEADSET_TALK_MS / 1000} seconds, then it mutes itself. You can switch to open mic once you're in.`;
 }
 
-// Mic mode is remembered per role, and ARs default to push to talk so the referee only hears
-// them when they mean to speak — no crowd, wind or breathing on an open mic all match.
-const PTT_ROLES = ['AR 1', 'AR 2'];
+// Mic mode is remembered per role. Every role starts on open mic for now (Jay's call, Nov 2026);
+// add a role here to have it start in push to talk instead, e.g. ['AR 1', 'AR 2'].
+const PTT_ROLES = [];
 function modeFor(role) {
   try {
     const saved = localStorage.getItem(`rc.mode.${role}`);
