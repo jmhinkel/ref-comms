@@ -18,7 +18,7 @@ const QUALITY_MS = 10000;  // how often to sample packet loss / delay per offici
 const AUDIO_BITRATE = 24000; // Opus voice: clear speech, roughly half the data of the browser default
 const HEADSET_TALK_MS = 5000; // push-to-talk via headset button: mic stays open this long
 const WATCHDOG_MS = 5000;  // how often to check for (and repair) anything that has quietly stopped
-const APP_VERSION = '2026-11-20';
+const APP_VERSION = '2026-11-20.2';
 const MIC_CONSTRAINTS = {
   audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1 },
   video: false,
@@ -53,7 +53,9 @@ const state = {
   audioCtx: null,
   localAnalyser: null,
   wakeLock: null,
-  peers: new Map(),        // peer id -> { id, info, dc, call, audio, analyser, speaking, lastSeen, stale }
+  peers: new Map(),
+  door: null,              // listen-only connection point, when the game is open to listeners
+  listeners: new Map(),    // listener calls on the door, by connection id        // peer id -> { id, info, dc, call, audio, analyser, speaking, lastSeen, stale }
   dialing: new Map(),      // peer id -> pending outgoing DataConnection
 };
 
@@ -295,7 +297,19 @@ function renderLobby() {
       status.textContent = 'No one on yet';
     }
     row.addEventListener('click', () => selectGame(g, { focus: true }));
-    list.append(row);
+    if (g.openListen) {
+      const wrap = document.createElement('div');
+      wrap.className = 'game-wrap';
+      const listenBtn = document.createElement('button');
+      listenBtn.type = 'button';
+      listenBtn.className = 'listen-btn';
+      listenBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 3a9 9 0 0 0-9 9v6a3 3 0 0 0 3 3h2v-8H5v-1a7 7 0 0 1 14 0v1h-3v8h2a3 3 0 0 0 3-3v-6a9 9 0 0 0-9-9z"/></svg> Listen · no code needed';
+      listenBtn.addEventListener('click', () => startListening(g));
+      wrap.append(row, listenBtn);
+      list.append(wrap);
+    } else {
+      list.append(row);
+    }
   }
 }
 
@@ -340,6 +354,7 @@ async function createGame() {
   const code = $('#cgCode').textContent;
   const game = {
     home: $('#cgHome').value.trim(), away: $('#cgAway').value.trim(), venue: $('#cgVenue').value.trim(),
+    openListen: $('#cgOpenListen').checked,
     kickoff: new Date($('#cgKickoff').value).toISOString(),
   };
   btn.disabled = true; btn.textContent = 'Listing…';
@@ -371,8 +386,116 @@ async function createGame() {
 function lobbyCheckIn(gone = false) {
   if (!state.game || !state.slot || !state.me) return;
   state.lobbySeen = Date.now();
-  postJSON(`/api/lobby/${state.game.id}/presence`, { code: state.room, seat: state.slot, role: state.me.role, gone }, { keepalive: true })
+  postJSON(`/api/lobby/${state.game.id}/presence`, { code: state.room, seat: state.slot, role: state.me.role, talks: !!state.localTrack, gone }, { keepalive: true })
+    .then(r => r.json())
+    .then(data => {
+      if (gone || !state.game || typeof data.openListen !== 'boolean') return;
+      if (data.openListen !== !!state.game.openListen) note(`listening without a code switched ${data.openListen ? 'on' : 'off'}`);
+      state.game.openListen = data.openListen;
+      syncListenDoor();
+    })
     .catch(() => { /* the lobby is a nice-to-have; audio doesn't depend on it */ });
+}
+
+// ---------- listeners (no code needed, can't be heard) ----------
+// When the game is open to listeners, each official's phone opens a second, separate connection
+// point — a "listen door" — that only ever sends this phone's mic out. Listeners ring the doors of
+// the officials on duty. The door never plays anything it receives, and listeners never join the
+// officials' own channel (that still needs the code), so a listener can't be heard by anyone.
+// Each extra listener is one more stream this phone uploads, so the number is capped.
+const MAX_LISTENERS = 4;
+const listenDoorId = (gameId, seat) => `${ID_PREFIX}door-${gameId}-${seat}`;
+
+function syncListenDoor() {
+  const want = !state.leaving && state.game?.openListen && state.localTrack && state.slot && state.pj && !state.pj.destroyed;
+  if (!want) { if (state.door) closeListenDoor(); return; }
+  const id = listenDoorId(state.game.id, state.slot);
+  const door = state.door;
+  if (door && !door.destroyed && door.id === id) {
+    if (door.disconnected && !state.doorReconnecting) {
+      state.doorReconnecting = true;
+      setTimeout(() => {
+        state.doorReconnecting = false;
+        if (state.door === door && door.disconnected && !door.destroyed) door.reconnect();
+      }, 2000);
+    }
+    return;
+  }
+  if (door) closeListenDoor();
+  if (Date.now() < (state.doorRetryAt || 0)) return;
+  openListenDoor(id);
+}
+
+function openListenDoor(id) {
+  const door = new Peer(id, peerOptions());
+  state.door = door;
+  door.on('open', () => { note('open to listeners'); renderListenBadge(); });
+  door.on('call', call => {
+    if (state.door !== door) { call.close(); return; }
+    if (state.listeners.size >= MAX_LISTENERS) { note(`listener turned away (already ${MAX_LISTENERS})`); call.close(); return; }
+    call.answer(state.outStream, { sdpTransform: tuneSdp });
+    state.listeners.set(call.connectionId, call);
+    note(`listener joined (${state.listeners.size} listening)`);
+    const gone = () => {
+      if (!state.listeners.delete(call.connectionId)) return;
+      note(`listener left (${state.listeners.size} listening)`);
+      renderListenBadge();
+    };
+    call.on('close', gone);
+    call.on('error', gone);
+    call.peerConnection?.addEventListener('connectionstatechange', () => {
+      const st = call.peerConnection.connectionState;
+      if (st === 'connected') tuneSender(call.peerConnection);
+      if (st === 'failed' || st === 'closed') { call.close(); gone(); }
+    });
+    renderListenBadge();
+  });
+  door.on('error', err => {
+    if (err.type === 'unavailable-id') {
+      // The previous door for this seat hasn't been released yet; try again shortly.
+      if (state.door === door) state.door = null;
+      door.destroy();
+      state.doorRetryAt = Date.now() + 5000;
+    }
+  });
+}
+
+function closeListenDoor() {
+  const door = state.door;
+  state.door = null;
+  for (const call of state.listeners.values()) call.close();
+  state.listeners.clear();
+  if (door) { door.destroy(); note('closed to listeners'); }
+  renderListenBadge();
+}
+
+function renderListenBadge() {
+  const badge = $('#listenBadge');
+  if (!badge) return;
+  badge.hidden = !state.door;
+  const n = state.listeners.size;
+  badge.textContent = `Open to listeners · ${n} listening${n >= MAX_LISTENERS ? ' (full)' : ''}`;
+}
+
+async function setOpenListen(open) {
+  const token = loadManageTokens()[state.game?.id];
+  if (!token) return;
+  const toggle = $('#openListenToggle');
+  toggle.disabled = true;
+  try {
+    const res = await postJSON(`/api/lobby/${state.game.id}/settings`, { manageToken: token, openListen: open });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || "Couldn't change the setting.");
+    state.game.openListen = data.openListen;
+    note(`listening without a code switched ${data.openListen ? 'on' : 'off'}`);
+    syncListenDoor();
+    // The rest of the crew picks the change up on their next check-in (within a minute).
+  } catch (err) {
+    toggle.checked = !open;
+    alert(err.message);
+  } finally {
+    toggle.disabled = false;
+  }
 }
 
 async function endListedGame() {
@@ -567,8 +690,9 @@ async function recoverMic() {
     const old = state.localStream;
     useMicStream(stream);
     old?.getTracks().forEach(t => t.stop());
-    for (const p of state.peers.values()) {
-      for (const sender of p.call?.peerConnection?.getSenders() || []) {
+    const calls = [...[...state.peers.values()].map(p => p.call), ...state.listeners.values()];
+    for (const call of calls) {
+      for (const sender of call?.peerConnection?.getSenders() || []) {
         if (!sender.track || sender.track.kind === 'audio') await sender.replaceTrack(state.localTrack).catch(() => {});
       }
     }
@@ -613,6 +737,7 @@ function watchdog() {
   if (document.visibilityState === 'visible' && (!state.wakeLock || state.wakeLock.released)) requestWakeLock();
   if (Date.now() - (state.lastMatchSaved || 0) > 60000) saveLastMatch(); // keep "rejoin" fresh
   if (Date.now() - (state.lobbySeen || 0) > 60000) lobbyCheckIn();     // keep the lobby's LIVE badge fresh
+  syncListenDoor();
 }
 
 // The screen was off (or another app was in front). Don't wait for the next watchdog pass:
@@ -1396,6 +1521,7 @@ function setupLiveControls() {
   });
   $('#copyLink').addEventListener('click', copyLink);
   $('#endGameBtn').addEventListener('click', endListedGame);
+  $('#openListenToggle').addEventListener('change', e => setOpenListen(e.target.checked));
 
   $('#netStatus').addEventListener('click', () => { renderLog(); $('#logDlg').showModal(); });
   $('#reconnectBtn').addEventListener('click', () => { $('#logDlg').close(); reconnectAll(); });
@@ -1423,6 +1549,7 @@ function leave() {
   note('left the match');
   saveLog();
   clearLastMatch(); // a deliberate Leave doesn't offer a rejoin
+  closeListenDoor();
   lobbyCheckIn(true); // and the lobby stops counting this phone straight away
   state.leaving = true;
   clearInterval(state.watchdog);
@@ -1443,7 +1570,11 @@ function openShare() {
   $('#shareCode').textContent = state.room;
   $('#shareGame').hidden = !state.game;
   if (state.game) $('#shareGame').textContent = `${gameTitle(state.game)} · ${gameWhen(state.game)}`;
-  $('#endGameBtn').hidden = !(state.game && loadManageTokens()[state.game.id]);
+  const owner = !!(state.game && loadManageTokens()[state.game.id]);
+  $('#endGameBtn').hidden = !owner;
+  $('#openListenRow').hidden = !owner;
+  if (owner) $('#openListenToggle').checked = !!state.game.openListen;
+  $('#shareListen').hidden = owner || !state.game?.openListen;
   $('#shareUrl').textContent = url.replace(/^https?:\/\//, '');
   if (window.qrcode) {
     const qr = qrcode(0, 'M'); qr.addData(url); qr.make();
@@ -1578,6 +1709,154 @@ function meterLoop() {
     }
   }
   requestAnimationFrame(meterLoop);
+}
+
+// ---------- listening without a code ----------
+// A listener rings the "listen door" of each official on duty (see syncListenDoor). They never
+// send anything that's played, never ask for the mic, and never join the officials' channel.
+const LISTEN_REFRESH_MS = 8000;
+const listen = { game: null, pj: null, calls: new Map(), timer: null, silent: null, startedAt: 0 };
+
+async function startListening(g) {
+  if (state.me || listen.game) return;
+  // Inside the tap: iOS only allows audio to start from a user gesture.
+  state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  state.audioCtx.resume();
+  listen.silent = state.audioCtx.createMediaStreamDestination().stream; // PeerJS calls need a stream to send
+  listen.game = g;
+  listen.startedAt = Date.now();
+  clearInterval(state.lobbyTimer);
+  $('#join').hidden = true;
+  $('#listenScreen').hidden = false;
+  $('#lsTitle').textContent = gameTitle(g);
+  $('#lsMeta').textContent = [gameWhen(g), g.venue].filter(Boolean).join(' · ');
+  $('#lsLeave').onclick = () => { location.href = '/'; };
+  $('#lsUnlock').onclick = () => {
+    state.audioCtx.resume();
+    for (const c of listen.calls.values()) c.audio?.play().catch(() => {});
+    $('#lsUnlock').hidden = true;
+  };
+  requestWakeLock();
+  renderListen();
+
+  const cfg = await fetch('/config.json').then(r => r.json()).catch(() => null);
+  if (cfg?.hasTurn) state.iceServers = cfg.iceServers;
+  listen.pj = new Peer(`${ID_PREFIX}ear-${g.id}-${makeCode(8).toLowerCase()}`, peerOptions());
+  listen.pj.on('open', listenScan);
+  listen.pj.on('disconnected', () => setTimeout(() => {
+    if (listen.pj && listen.pj.disconnected && !listen.pj.destroyed) listen.pj.reconnect();
+  }, 2000));
+  listen.pj.on('error', () => { /* empty or full doors are retried on the next refresh */ });
+  listen.timer = setInterval(listenRefresh, LISTEN_REFRESH_MS);
+  requestAnimationFrame(listenMeterLoop);
+}
+
+// Re-read the game from the lobby (who's on, whether listening is still allowed), then reconnect.
+async function listenRefresh() {
+  try {
+    const res = await fetch('/api/lobby', { cache: 'no-store' });
+    if (res.ok) {
+      const g = (await res.json()).games.find(x => x.id === listen.game.id);
+      if (!g || !g.openListen) {
+        stopListening(g ? 'Listening without a code has been turned off for this game.' : 'This game is no longer listed.');
+        return;
+      }
+      listen.game = g;
+    }
+  } catch { /* keep going with what we know */ }
+  listenScan();
+}
+
+function listenScan() {
+  const pj = listen.pj;
+  if (!pj || pj.disconnected || pj.destroyed) return;
+  const seats = listen.game.seats || [];
+  for (const { seat, role } of seats) {
+    const cur = listen.calls.get(seat);
+    if (cur) {
+      cur.role = role;
+      const st = cur.call.peerConnection?.connectionState;
+      const stuck = st !== 'connected' && Date.now() - cur.started > 15000; // full, gone, or never answered
+      if (!stuck && st !== 'failed' && st !== 'closed') continue;
+      dropListenCall(seat);
+    }
+    const call = pj.call(listenDoorId(listen.game.id, seat), listen.silent, { metadata: { listener: true }, sdpTransform: tuneSdp });
+    if (!call) continue;
+    const entry = { call, role, audio: null, analyser: null, speaking: false, started: Date.now() };
+    listen.calls.set(seat, entry);
+    call.on('stream', stream => {
+      if (!entry.audio) {
+        entry.audio = document.createElement('audio');
+        entry.audio.autoplay = true;
+        entry.audio.setAttribute('playsinline', '');
+        $('#audioSink').appendChild(entry.audio);
+      }
+      entry.audio.srcObject = stream;
+      entry.audio.play().catch(() => { $('#lsUnlock').hidden = false; });
+      entry.analyser = makeAnalyser(stream);
+      renderListen();
+    });
+    call.on('close', () => { if (listen.calls.get(seat) === entry) dropListenCall(seat); });
+    call.on('error', () => {});
+    call.peerConnection?.addEventListener('connectionstatechange', renderListen);
+  }
+  // Officials who have left.
+  for (const seat of [...listen.calls.keys()]) {
+    if (!seats.some(x => x.seat === seat)) dropListenCall(seat);
+  }
+  renderListen();
+}
+
+function dropListenCall(seat) {
+  const entry = listen.calls.get(seat);
+  if (!entry) return;
+  listen.calls.delete(seat);
+  entry.call.close();
+  if (entry.audio) { entry.audio.srcObject = null; entry.audio.remove(); }
+  renderListen();
+}
+
+function stopListening(message) {
+  clearInterval(listen.timer);
+  for (const seat of [...listen.calls.keys()]) dropListenCall(seat);
+  listen.pj?.destroy();
+  alert(message);
+  location.href = '/';
+}
+
+function renderListen() {
+  const seats = listen.game?.seats || [];
+  const heard = [...listen.calls.values()].filter(c => c.call.peerConnection?.connectionState === 'connected').length;
+  const status = $('#lsStatus');
+  if (!seats.length) status.textContent = 'No officials are on yet. You\'ll hear them as soon as they join.';
+  else if (heard) status.textContent = `Hearing ${heard} of ${seats.length} official${seats.length === 1 ? '' : 's'}.`;
+  else if (Date.now() - listen.startedAt > 20000) status.textContent = `Can't connect yet. Listening may be full (${MAX_LISTENERS} listeners max). Still trying…`;
+  else status.textContent = 'Connecting…';
+
+  const root = $('#lsRoster');
+  root.innerHTML = '';
+  for (const { seat, role } of seats) {
+    const entry = listen.calls.get(seat);
+    const up = entry?.call.peerConnection?.connectionState === 'connected';
+    root.append(rosterCard({
+      id: `ls${seat}`, name: role, role,
+      micClass: up ? 'live' : 'muted', micText: up ? 'HEARING' : '…',
+      dotClass: up ? 'ok' : 'warn', statusText: up ? 'Connected' : 'Connecting…',
+      speaking: entry?.speaking,
+    }));
+  }
+}
+
+function listenMeterLoop() {
+  if (!listen.game) return;
+  for (const [seat, entry] of listen.calls) {
+    const speaking = level(entry.analyser) > SPEAKING_THRESHOLD;
+    if (speaking !== entry.speaking) {
+      entry.speaking = speaking;
+      document.querySelector(`.official[data-id="ls${seat}"]`)?.classList.toggle('speaking', speaking);
+    }
+  }
+  requestAnimationFrame(listenMeterLoop);
 }
 
 initJoin();

@@ -99,6 +99,23 @@ button.small { padding: 8px 10px; font-size: .9rem; }
 .game-status { flex: 0 0 auto; font-size: .72rem; font-weight: 800; letter-spacing: .04em; color: var(--muted); text-align: right; max-width: 40%; }
 .game-status.live { color: var(--green); background: #10301f; padding: 6px 8px; border-radius: 8px; }
 
+.game-wrap { display: flex; flex-direction: column; gap: 6px; }
+.listen-btn {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  background: #0f2338; color: var(--blue); border: 1px solid #1d4a75; padding: 10px; font-size: .9rem;
+}
+.listen-badge {
+  background: #0f2338; color: var(--blue); border-radius: 12px; padding: 10px 14px;
+  font-weight: 700; font-size: .9rem; text-align: center;
+}
+.share-listen-toggle { margin: 12px 2px 0; font-size: .95rem; }
+.share-listen { margin: 12px 0 0; color: var(--blue); font-size: .9rem; text-align: center; }
+.listen-title { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.listen-title .label { color: var(--blue); font-size: .7rem; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+.listen-title b { font-size: 1.15rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.listen-title span:not(.label) { color: var(--muted); font-size: .85rem; }
+.ls-status { margin: 0; padding: 12px 14px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); font-weight: 600; }
+
 .selected-game {
   display: flex; align-items: center; gap: 10px;
   background: #10301f; border: 1px solid var(--green-dim); border-radius: 12px; padding: 12px 14px;

@@ -104,6 +104,7 @@
       <button id="leaveBtn" class="ghost">Leave</button>
     </header>
 
+    <div id="listenBadge" class="listen-badge" hidden></div>
     <div id="banner" class="banner" hidden></div>
 
     <section id="roster" class="roster" aria-live="polite"></section>
@@ -126,6 +127,22 @@
     </section>
   </main>
 
+  <!-- Listening without a code -->
+  <main id="listenScreen" class="screen" hidden>
+    <header class="topbar">
+      <div class="listen-title">
+        <span class="label">Listening</span>
+        <b id="lsTitle"></b>
+        <span id="lsMeta"></span>
+      </div>
+      <button id="lsLeave" class="ghost">Leave</button>
+    </header>
+    <p id="lsStatus" class="ls-status">Connecting…</p>
+    <button id="lsUnlock" class="primary big" hidden>Tap to turn on the audio</button>
+    <section id="lsRoster" class="roster"></section>
+    <p class="hint">Listen only: the officials can't hear you, and your microphone is never used.</p>
+  </main>
+
   <!-- List a game -->
   <dialog id="createDlg">
     <h2>List a game</h2>
@@ -138,7 +155,8 @@
         <div><span class="label">Match code</span><b id="cgCode"></b></div>
         <button type="button" id="cgNewCode" class="ghost small">New code</button>
       </div>
-      <p class="create-hint">Everyone who opens Ref Comms will see the game. Only people you give the code to can join the audio.</p>
+      <label class="check"><input type="checkbox" id="cgOpenListen"> Let anyone listen without the code (up to 4)</label>
+      <p class="create-hint">Everyone who opens Ref Comms will see the game. Only people you give the code to can talk. Listeners can only hear, and you can switch listening on or off later.</p>
       <p id="cgError" class="error" hidden></p>
       <div class="row">
         <button type="submit" class="primary" id="cgSubmit">List game</button>
@@ -158,6 +176,8 @@
       <button id="nativeShare" class="primary">Share link</button>
       <button id="copyLink" class="secondary">Copy</button>
     </div>
+    <label id="openListenRow" class="check share-listen-toggle" hidden><input type="checkbox" id="openListenToggle"> Let anyone listen without the code (up to 4)</label>
+    <p id="shareListen" class="share-listen" hidden>This game is open to listeners: anyone can hear the crew without the code.</p>
     <button id="endGameBtn" class="ghost wide" hidden>Remove from game list</button>
     <form method="dialog"><button class="ghost wide">Close</button></form>
   </dialog>

@@ -26,6 +26,11 @@ The start screen lists today's and upcoming games, so officials can see their ma
 - Only the phone that listed a game can remove it (share screen → **Remove from game list**). Removing it doesn't
   disconnect anyone. Games also drop off the list by themselves after the match.
 - You can still join an unlisted match with just a code.
+- **Listening without a code (optional, per game).** Whoever lists the game can tick **Let anyone listen without the
+  code**, or switch it on or off later from the share screen. Up to 4 people can then tap **Listen** on the game and hear
+  the crew, with no mic and no code. Listeners connect to a separate listen-only route on each official's phone, which
+  never plays anything back, so they can't be heard. Officials see **Open to listeners · N listening**. Each listener
+  is an extra stream every official's phone has to send, which is why there's a cap.
 
 Games are stored in Netlify Blobs (`netlify/functions/lobby.mjs`, logic in `src/lobby.mjs`). Locally they're stored in `.data/`.
 Run `npm test` for the lobby tests.

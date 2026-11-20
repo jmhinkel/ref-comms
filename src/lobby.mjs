@@ -1,6 +1,10 @@
 // Game lobby: a public list of games so officials can see their match is set up, while the audio
 // itself still needs the match code. The code is never stored or returned — only a salted hash,
 // checked here — and the public list shows roles that are connected, never names.
+//
+// A game can also be "open to listeners": anyone may listen without the code. That's controlled by
+// whoever listed the game, and listeners connect through a separate listen-only route on each
+// official's phone (see the app), so the code is still the only way to be heard.
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 
 const HOUR = 3600e3;
@@ -38,6 +42,7 @@ export async function handleLobby(req, kv, now = Date.now()) {
     if (req.method === 'POST' && action === 'verify') return await verify(kv, game, await body(), now);
     if (req.method === 'POST' && action === 'presence') return await presence(kv, game, await body(), now);
     if (req.method === 'POST' && action === 'end') return await endGame(kv, game, await body());
+    if (req.method === 'POST' && action === 'settings') return await settings(kv, game, await body());
     return json(405, { error: 'Not supported.' });
   } catch (err) {
     console.error('lobby error', err);
@@ -52,20 +57,25 @@ async function listGames(kv, now) {
     const kickoff = Date.parse(g.kickoff);
     if (g.ended || now - kickoff > PURGE_AFTER_MS) { await purge(kv, g.id); continue; }
     if (kickoff - now > SHOW_AHEAD_MS) continue;
-    const live = await liveRoles(kv, g.id, now);
-    if (now - kickoff > SHOW_AFTER_MS && !live.length) continue;
-    out.push({ id: g.id, home: g.home, away: g.away, venue: g.venue, kickoff: g.kickoff, live });
+    const seats = await liveSeats(kv, g.id, now);
+    if (now - kickoff > SHOW_AFTER_MS && !seats.length) continue;
+    const entry = { id: g.id, home: g.home, away: g.away, venue: g.venue, kickoff: g.kickoff, live: seats.map(s => s.role), openListen: !!g.openListen };
+    // Listeners need to know which seats to tune in to (seat numbers and roles only).
+    if (g.openListen) entry.seats = seats.filter(s => s.talks).map(({ seat, role }) => ({ seat, role }));
+    out.push(entry);
   }
   // Games with officials connected first, then by kickoff.
   return out.sort((a, b) => (b.live.length > 0) - (a.live.length > 0) || Date.parse(a.kickoff) - Date.parse(b.kickoff));
 }
 
-async function liveRoles(kv, id, now) {
-  const seats = (await Promise.all((await kv.list(`presence/${id}/`)).map(k => kv.get(k)))).filter(Boolean);
+async function liveSeats(kv, id, now) {
+  const keys = await kv.list(`presence/${id}/`);
+  const seats = await Promise.all(keys.map(async k => ({ seat: Number(k.split('/').pop()), ...(await kv.get(k)) })));
+  const rank = role => (ROLE_ORDER.indexOf(role) + 99) % 99; // unknown roles last
   return seats
-    .filter(s => now - s.at < LIVE_MS)
-    .map(s => s.role)
-    .sort((a, b) => (ROLE_ORDER.indexOf(a) + 99) % 99 - (ROLE_ORDER.indexOf(b) + 99) % 99);
+    .filter(s => s.at && now - s.at < LIVE_MS)
+    .map(s => ({ seat: s.seat, role: s.role, talks: s.talks !== false }))
+    .sort((a, b) => rank(a.role) - rank(b.role));
 }
 
 async function purge(kv, id) {
@@ -88,7 +98,7 @@ async function createGame(kv, b, now) {
   await kv.set(`game/${id}`, {
     id, home, away, venue, kickoff: new Date(kickoff).toISOString(),
     salt, codeHash: sha(salt + code), manageHash: sha(manageToken),
-    createdAt: new Date(now).toISOString(), fails: [],
+    createdAt: new Date(now).toISOString(), fails: [], openListen: !!b.openListen,
   });
   return json(201, { id, manageToken });
 }
@@ -107,8 +117,16 @@ async function presence(kv, game, b, now) {
   if (!Number.isInteger(seat) || seat < 1 || seat > 8) return json(400, { error: 'Bad seat.' });
   const key = `presence/${game.id}/${seat}`;
   if (b.gone) await kv.del(key);
-  else await kv.set(key, { role: clean(b.role, 20) || 'Official', at: now });
-  return json(200, { ok: true });
+  else await kv.set(key, { role: clean(b.role, 20) || 'Official', talks: b.talks !== false, at: now });
+  // Check-ins double as the way officials' phones learn if listening was switched on or off.
+  return json(200, { ok: true, openListen: !!game.openListen });
+}
+
+async function settings(kv, game, b) {
+  if (!b.manageToken || sha(String(b.manageToken)) !== game.manageHash) return json(403, { error: 'Only the phone that listed this game can change it.' });
+  const updated = { ...game, openListen: !!b.openListen };
+  await kv.set(`game/${game.id}`, updated);
+  return json(200, { ok: true, openListen: updated.openListen });
 }
 
 async function endGame(kv, game, b) {

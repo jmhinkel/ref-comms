@@ -29,7 +29,8 @@ test('a listed game appears without its code, salt or tokens', async () => {
   assert.equal(created.status, 201);
   const { body } = await call('GET', '');
   assert.equal(body.games.length, 1);
-  assert.deepEqual(Object.keys(body.games[0]).sort(), ['away', 'home', 'id', 'kickoff', 'live', 'venue']);
+  assert.deepEqual(Object.keys(body.games[0]).sort(), ['away', 'home', 'id', 'kickoff', 'live', 'openListen', 'venue']);
+  assert.equal(body.games[0].openListen, false);
   assert.ok(!JSON.stringify(body).includes('K7M2QX'));
   await cleanup();
 });
@@ -87,5 +88,32 @@ test('bad input is rejected', async () => {
   assert.equal((await call('POST', '', { ...newGame, away: '' })).status, 400);
   assert.equal((await call('POST', '', { ...newGame, code: 'ABCD' })).status, 400);
   assert.equal((await call('POST', '', { ...newGame, kickoff: 'soon' })).status, 400);
+  await cleanup();
+});
+
+test('listening without a code is off by default and only the lister can switch it', async () => {
+  const { call, cleanup } = await setup();
+  const { body: { id, manageToken } } = await call('POST', '', newGame);
+  let g = (await call('GET', '')).body.games[0];
+  assert.equal(g.openListen, false);
+  assert.equal(g.seats, undefined); // no seat map unless listening is open
+  assert.equal((await call('POST', `/${id}/settings`, { manageToken: 'guess', openListen: true })).status, 403);
+  assert.equal((await call('POST', `/${id}/settings`, { manageToken, openListen: true })).status, 200);
+  const checkIn = await call('POST', `/${id}/presence`, { code: 'K7M2QX', seat: 3, role: 'AR 1', name: 'Sam' });
+  assert.equal(checkIn.body.openListen, true); // officials' phones learn the setting from check-ins
+  await call('POST', `/${id}/presence`, { code: 'K7M2QX', seat: 1, role: 'Referee' });
+  await call('POST', `/${id}/presence`, { code: 'K7M2QX', seat: 5, role: 'Assessor', talks: false });
+  g = (await call('GET', '')).body.games[0];
+  assert.equal(g.openListen, true);
+  assert.deepEqual(g.seats, [{ seat: 1, role: 'Referee' }, { seat: 3, role: 'AR 1' }]); // talkers only, roles not names
+  assert.deepEqual(g.live, ['Referee', 'AR 1', 'Assessor']);
+  assert.ok(!JSON.stringify(g).includes('Sam') && !JSON.stringify(g).includes('K7M2QX'));
+  await cleanup();
+});
+
+test('a game can be listed open to listeners from the start', async () => {
+  const { call, cleanup } = await setup();
+  await call('POST', '', { ...newGame, openListen: true });
+  assert.equal((await call('GET', '')).body.games[0].openListen, true);
   await cleanup();
 });
